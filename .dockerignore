@@ -1,0 +1,21 @@
+# Version control / VCS
+.git
+.gitignore
+
+# Virtual environments and caches
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+
+# Node data must never enter the image
+*.sqlite3
+*.identity.key
+
+# Not needed for the runtime image
+tests
+docs
+examples

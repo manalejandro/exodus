@@ -1,0 +1,54 @@
+# exodus — a single-node stack: the consensus node plus a read-only API.
+#
+#   docker compose up -d          # build + start node and api
+#   curl http://127.0.0.1:52515/exodus/status
+#
+# The node and the api share one /data volume (identity + SQLite ledger).
+# The api only reads the ledger; it starts after the node is healthy so the
+# genesis block is guaranteed to exist.  Note: multi-node networking is not
+# wired up yet — the bundled transport is in-process (LocalTransport).  When a
+# real network transport lands (ZenohBridgeTransport), point several nodes at
+# the same pub/sub broker instead of one container.
+
+services:
+  exodus:
+    build: .
+    image: exodus:latest
+    container_name: exodus-node
+    restart: unless-stopped
+    volumes:
+      - exodus-data:/data
+    environment:
+      # Protocol tunables — see docs/protocol.md
+      EXODUS_EPOCH_SECONDS: "30"
+      EXODUS_ELECTION_TIMEOUT_SECONDS: "90"
+      EXODUS_HEARTBEAT_SECONDS: "10"
+      EXODUS_BYZANTINE: "true"
+      # Reward tunables — see docs/incentives.md
+      EXODUS_CREDITS_PER_CU: "0.01"
+      EXODUS_REWARD_DIMINISHING: "0.85"
+      EXODUS_FREE_QUOTA_SECONDS: "300"
+      EXODUS_SECONDS_PER_CREDIT: "60"
+    healthcheck:
+      test: ["CMD", "exodus", "status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  api:
+    build: .
+    image: exodus:latest
+    container_name: exodus-api
+    restart: unless-stopped
+    depends_on:
+      exodus:
+        condition: service_healthy
+    ports:
+      - "52515:52515"
+    volumes:
+      - exodus-data:/data
+    command: ["api", "--host", "0.0.0.0", "--port", "52515"]
+
+volumes:
+  exodus-data:
