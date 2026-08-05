@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -12,6 +12,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -182,12 +183,18 @@ fn available_models(c: &ExodusCoordinator) -> Vec<Value> {
     items
 }
 
+/// Upper bound for a single model upload (512 GiB) — effectively unlimited for
+/// real model files while still guarding against unbounded disk usage.
+const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024 * 1024;
+
 /// Store an uploaded model file (raw `application/octet-stream` body) under
-/// the models directory as `name`.
+/// the models directory as `name`.  The body is streamed straight to disk so
+/// multi-GB model files are not buffered in memory and do not hit axum's
+/// default request-body limit.
 async fn models_upload(
     State(c): State<Coord>,
     Query(q): Query<UploadQuery>,
-    body: Bytes,
+    body: Body,
 ) -> impl IntoResponse {
     let name = match q.name {
         Some(n) if safe_model_name(&n) => n,
@@ -198,12 +205,6 @@ async fn models_upload(
             )
         }
     };
-    if body.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "empty upload" })),
-        );
-    }
     let dir = c.config.models_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return (
@@ -211,7 +212,60 @@ async fn models_upload(
             Json(json!({ "error": "cannot create models directory" })),
         );
     }
-    if std::fs::write(dir.join(&name), &body).is_err() {
+    let path = dir.join(&name);
+    let tmp = dir.join(format!(".{name}.{}.uploading", uuid::Uuid::new_v4().simple()));
+    let mut file = match tokio::fs::File::create(&tmp).await {
+        Ok(f) => f,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "write failed" })),
+            )
+        }
+    };
+
+    let mut stream = body.into_data_stream();
+    let mut total: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                total += bytes.len() as u64;
+                if total > MAX_UPLOAD_BYTES {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        Json(json!({ "error": "upload exceeds maximum size" })),
+                    );
+                }
+                if file.write_all(&bytes).await.is_err() {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "write failed" })),
+                    );
+                }
+            }
+            Err(_) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "upload read failed" })),
+                );
+            }
+        }
+    }
+    let _ = file.flush().await;
+    drop(file);
+
+    if total == 0 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "empty upload" })),
+        );
+    }
+    if tokio::fs::rename(&tmp, &path).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "write failed" })),
@@ -222,7 +276,7 @@ async fn models_upload(
         Json(json!({
             "message": "uploaded",
             "name": name,
-            "size_bytes": body.len(),
+            "size_bytes": total,
         })),
     )
 }
