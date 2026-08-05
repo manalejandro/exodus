@@ -528,6 +528,17 @@ impl ProtocolState {
             }
         }
         if let Err(e) = store.append(checkpoint) {
+            if store.is_already_committed(checkpoint) {
+                // Re-delivery or fork twin of an already-committed block:
+                // reconcile local state so we stop re-attempting the append
+                // and stop spamming SyncRequests for a block we already have.
+                for signed in &checkpoint.proposal.claims {
+                    self.pending.remove(&signed.claim.claim_id);
+                    self.proposed_claim_ids.remove(&signed.claim.claim_id);
+                    self.committed_claim_ids.insert(signed.claim.claim_id.clone());
+                }
+                return;
+            }
             eprintln!("local append rejected: {e}");
             self.outgoing.push((
                 topics::SYNC.to_string(),

@@ -84,6 +84,35 @@ impl ChainStore {
 
     pub fn close(&self) {}
 
+    /// Returns true when this checkpoint is a re-delivery or fork twin of an
+    /// already-committed block: every claim is already present in the ledger
+    /// (by `claim_id` or by the `node_id`/`seq` uniqueness constraint) or the
+    /// block height is already covered.  Used to reconcile local state when
+    /// `append` rejects a duplicate, instead of treating it as a live error.
+    pub fn is_already_committed(&self, checkpoint: &Checkpoint) -> bool {
+        let conn = self.conn.lock().unwrap();
+        if checkpoint.height() <= head_locked(&conn).unwrap_or(-1) {
+            return true;
+        }
+        checkpoint.proposal.claims.iter().all(|signed| {
+            let by_id = conn
+                .query_row(
+                    "SELECT 1 FROM claims WHERE claim_id = ?1",
+                    params![signed.claim.claim_id],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            let by_seq = conn
+                .query_row(
+                    "SELECT 1 FROM claims WHERE node_id = ?1 AND seq = ?2",
+                    params![signed.claim.node_id, signed.claim.seq],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            by_id || by_seq
+        })
+    }
+
     // -- writes --------------------------------------------------------------
 
     pub fn append(&self, checkpoint: &Checkpoint) -> Result<(), LedgerError> {
@@ -377,4 +406,93 @@ fn block_locked(conn: &Connection, height: i64) -> Option<crate::models::Checkpo
         )
         .ok()?;
     Some(reconstruct(prop, sig))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        make_claim, Checkpoint, CheckpointProposal, DeviceTier, Precision, SignedContribution,
+    };
+
+    fn temp_store() -> ChainStore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "exodus-ledger-test-{}-{n}",
+            std::process::id()
+        ));
+        let store = ChainStore::open(&path).unwrap();
+        store.append(&crate::models::genesis_checkpoint()).unwrap();
+        store
+    }
+
+    fn signed_claim(node_id: &str, seq: i64) -> SignedContribution {
+        let (private_key, _) = crate::crypto::generate_key_pair();
+        let claim = make_claim(
+            format!("claim-{node_id}-{seq}"),
+            node_id.to_string(),
+            seq,
+            "llama-3b.gguf",
+            3.0,
+            Precision::Int4,
+            512,
+            128,
+            12.5,
+            1.9e12,
+            DeviceTier::GpuNvidia,
+            "2026-08-05T00:00:00+00:00".to_string(),
+            "2026-08-05T00:00:12+00:00".to_string(),
+            0,
+            String::new(),
+        );
+        SignedContribution::create(claim, &private_key)
+    }
+
+    fn checkpoint_with(head: &Checkpoint, height: i64, epoch: i64, claims: Vec<SignedContribution>) -> Checkpoint {
+        Checkpoint {
+            proposal: CheckpointProposal {
+                epoch,
+                height,
+                prev_hash: head.block_hash(),
+                sealed_by: "exdsealer".to_string(),
+                claims,
+                created_at: crate::models::utcnow_iso(),
+            },
+            signatures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn duplicate_node_seq_rejected_then_recognised_as_committed() {
+        let store = temp_store();
+        let head = store.head().unwrap();
+        let claim = signed_claim("exdnode1", 1);
+        let block1 = checkpoint_with(&head, 1, 1, vec![claim.clone()]);
+        store.append(&block1).unwrap();
+
+        // A fork twin that reuses the same node/seq must be rejected by append…
+        let head = store.head().unwrap();
+        let twin = checkpoint_with(&head, 2, 2, vec![claim.clone()]);
+        let err = store.append(&twin).unwrap_err().0;
+        assert!(
+            err.contains("duplicate claim") || err.contains("duplicate node/seq"),
+            "unexpected error: {err}"
+        );
+
+        // …but the store recognises it as already committed, which is what lets
+        // the consensus layer reconcile instead of spinning on SyncRequests.
+        assert!(store.is_already_committed(&twin));
+    }
+
+    #[test]
+    fn fresh_claim_not_already_committed() {
+        let store = temp_store();
+        let head = store.head().unwrap();
+        let new_claim = signed_claim("exdnode2", 7);
+        let next = checkpoint_with(&head, 1, 1, vec![new_claim]);
+        assert!(!store.is_already_committed(&next));
+        assert!(store.append(&next).is_ok());
+    }
 }
