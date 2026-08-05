@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # args:
+      #   LLAMA_VERSION: "b10276"                            # llama.cpp release tag
+      #   LLAMA_ASSET: "llama-b10276-bin-ubuntu-x64.tar.gz"  # or -vulkan-x64/rocm...
     image: exodus:latest
     container_name: exodus-node
     restart: unless-stopped
@@ -28,8 +31,8 @@ services:
 
     # ---- persistent state -------------------------------------------------
     volumes:
-      - exodus-data:/data       # identity.key + ledger.sqlite3
-      - exodus-models:/models   # local model files
+      - ./exodus-data:/data       # identity.key + ledger.sqlite3
+      - ./exodus-models:/models   # local model files
 
     # ---- node configuration ------------------------------------------------
     environment:
@@ -46,6 +49,9 @@ services:
       # model layers are offloaded when a runtime uses the detected GPU.
       EXODUS_GPU_LAYERS: "35"               # layers offloaded to the GPU
       EXODUS_MODEL_DIR: "/models"           # where model files live
+      # EXODUS_LLAMA_BIN: "/opt/llama.cpp/llama-cli"  # override inference binary
+      # EXODUS_INFERENCE: "true"             # 0 -> chat returns the state stub
+      # EXODUS_MAX_TOKENS: "256"             # max generated tokens per reply
 
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:52515/exodus/healthz || exit 1"]

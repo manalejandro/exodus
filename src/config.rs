@@ -11,6 +11,10 @@ pub struct ExodusConfig {
     pub model_dir: Option<PathBuf>,
     pub gpu_layers: Option<i64>,
 
+    pub llama_bin: String,
+    pub inference: bool,
+    pub max_tokens: i64,
+
     pub epoch_seconds: f64,
     pub election_timeout_seconds: f64,
     pub byzantine: bool,
@@ -106,6 +110,9 @@ pub fn config_from_env() -> ExodusConfig {
         node_name: env_str("NODE_NAME", "exodus-node"),
         model_dir: model_dir.map(PathBuf::from),
         gpu_layers: env_int_optional("GPU_LAYERS"),
+        llama_bin: env_str("LLAMA_BIN", "llama-cli"),
+        inference: env_bool("INFERENCE", true),
+        max_tokens: env_int("MAX_TOKENS", 256),
         epoch_seconds: env_float("EPOCH_SECONDS", 30.0),
         election_timeout_seconds: env_float("ELECTION_TIMEOUT_SECONDS", 90.0),
         byzantine: env_bool("BYZANTINE", true),

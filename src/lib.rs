@@ -8,6 +8,7 @@ pub mod coordinator;
 pub mod crypto;
 pub mod gpu;
 pub mod identity;
+pub mod inference;
 pub mod ledger;
 pub mod models;
 pub mod network;

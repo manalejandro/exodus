@@ -347,10 +347,10 @@ async fn events(State(c): State<Coord>) -> Sse<impl tokio_stream::Stream<Item = 
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Chat with the distributed model.  This node does not bundle an inference
-/// runtime yet, so the reply is a structured stub reporting the model, GPU
-/// state and available model files; swap `chat_reply` for a real inference
-/// call once a runtime is attached.
+/// Chat with the distributed model.  When a llama.cpp runtime is available
+/// (`EXODUS_LLAMA_BIN`, default `llama-cli`) and a model file is present, the
+/// node runs a real completion; otherwise it returns a truthful stub
+/// describing the node state.
 async fn chat(State(c): State<Coord>, Json(req): Json<ChatRequest>) -> impl IntoResponse {
     if req.messages.is_empty() {
         return (
@@ -368,14 +368,62 @@ async fn chat(State(c): State<Coord>, Json(req): Json<ChatRequest>) -> impl Into
         }
         None => model_files(&c).into_iter().next().unwrap_or_else(|| "auto".to_string()),
     };
-    let prompt = req
+    let turns: Vec<crate::inference::ChatTurn> = req
         .messages
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    (StatusCode::OK, Json(chat_reply(&c, &model, &prompt)))
+        .map(|m| crate::inference::ChatTurn {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+    (StatusCode::OK, Json(chat_response(&c, &model, &turns).await))
+}
+
+async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTurn]) -> Value {
+    let gpu = c.gpu_info();
+    let files = model_files(c);
+    let stub = |reason: &str| chat_stub(c, &gpu, &files, model, reason);
+    let Some(model_path) = model_path_for(c, model) else {
+        return stub("model file not present");
+    };
+    if !c.config.inference {
+        return stub("inference disabled (EXODUS_INFERENCE=0)");
+    }
+    let config = c.config.clone();
+    let path = model_path.clone();
+    let turns = turns.to_vec();
+    let gpu_for_task = gpu.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::inference::complete(&config, &gpu_for_task, &path, &turns)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    match outcome {
+        Ok(reply) => json!({
+            "runtime": "llama.cpp",
+            "model": model,
+            "model_present": true,
+            "models": files,
+            "gpu": gpu.to_value(),
+            "reply": reply,
+        }),
+        Err(e) => stub(&format!("runtime error: {e}")),
+    }
+}
+
+/// Resolve a model name to a file on disk; `auto` picks the first file in the
+/// models directory.
+fn model_path_for(c: &ExodusCoordinator, model: &str) -> Option<PathBuf> {
+    let name = if model == "auto" {
+        model_files(c).into_iter().next()?
+    } else {
+        model.to_string()
+    };
+    if !safe_model_name(&name) {
+        return None;
+    }
+    let path = c.config.models_dir().join(&name);
+    path.is_file().then_some(path)
 }
 
 /// Names of the model files present in the models directory, sorted.
@@ -395,27 +443,24 @@ fn model_files(c: &ExodusCoordinator) -> Vec<String> {
     files
 }
 
-fn chat_reply(c: &ExodusCoordinator, model: &str, prompt: &str) -> Value {
-    let gpu = c.gpu_info();
-    let files = model_files(c);
-    let present = files.iter().any(|f| f == model);
-    let absent = if present {
-        String::new()
-    } else {
-        format!(" (selected '{model}' is not present)")
-    };
+fn chat_stub(
+    _c: &ExodusCoordinator,
+    gpu: &crate::gpu::GpuInfo,
+    files: &[String],
+    model: &str,
+    reason: &str,
+) -> Value {
     json!({
         "runtime": "stub",
         "model": model,
-        "model_present": present,
+        "model_present": files.iter().any(|f| f == model),
         "models": files,
         "gpu": gpu.to_value(),
         "reply": format!(
-            "[{model}] No inference runtime is bundled in this node yet, so I can't generate a real answer.\n\nNode state: {} ({}) with {} model file(s){absent}.\nReceived {} char(s) from the last message.",
+            "[{model}] No inference runtime is bundled in this node yet ({reason}), so I can't generate a real answer.\n\nNode state: {} ({}) with {} model file(s).",
             if gpu.available { "GPU-ready" } else { "CPU-only" },
             gpu.tier_string(),
             files.len(),
-            prompt.chars().count(),
         ),
     })
 }

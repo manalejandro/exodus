@@ -1,5 +1,21 @@
 # syntax=docker/dockerfile:1
 
+# ---- llama.cpp (prebuilt release) ---------------------------------------
+# Pin a llama.cpp release and pull its prebuilt Linux binaries so the chat
+# runtime is available without compiling from source.  Swap LLAMA_ASSET to a
+# GPU variant (e.g. ...-ubuntu-vulkan-x64.tar.gz) when the host exposes one.
+FROM debian:bookworm-slim AS llamacpp
+ARG LLAMA_VERSION=b10276
+ARG LLAMA_ASSET=llama-${LLAMA_VERSION}-bin-ubuntu-x64.tar.gz
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget -q -O /llama.tar.gz \
+       "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${LLAMA_ASSET}" \
+    && mkdir -p /opt/llama.cpp \
+    && tar xzf /llama.tar.gz -C /opt/llama.cpp --strip-components=1 \
+    && rm /llama.tar.gz
+
 # ---- builder -------------------------------------------------------------
 FROM rust:1.97-bookworm AS builder
 WORKDIR /build
@@ -17,11 +33,14 @@ RUN cargo build --release
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini wget \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates tini wget \
+       libstdc++6 libgomp1 libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" --home /home/exodus exodus
 
 COPY --from=builder /build/target/release/exodus /usr/local/bin/exodus
+COPY --from=llamacpp /opt/llama.cpp /opt/llama.cpp
 
 # The node is CPU-only today; NVIDIA_* vars are provided so the container is
 # ready for GPU inference once the runtime uses the device (the driver libs are
@@ -35,7 +54,8 @@ ENV EXODUS_DATA_DIR=/data \
     EXODUS_NODE_HOST=0.0.0.0 \
     EXODUS_NODE_PORT=52514 \
     EXODUS_API_HOST=0.0.0.0 \
-    EXODUS_API_PORT=52515
+    EXODUS_API_PORT=52515 \
+    EXODUS_LLAMA_BIN=/opt/llama.cpp/llama-cli
 
 RUN mkdir -p /data /models && chown -R exodus:exodus /data /models
 

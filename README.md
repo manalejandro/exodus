@@ -120,6 +120,22 @@ dashboard at `/exodus/dash.html` (both single-file HTML, no external deps).
 | GET | `/exodus/events` | SSE stream of block commits |
 | POST | `/exodus/chat` | Chat with the distributed model (`{"model": "…", "messages": […]}`) |
 
+### Chat
+
+`POST /exodus/chat` accepts a JSON body:
+
+```json
+{ "model": "Llama-3.2-3B-Instruct-Q4_K_M.gguf", "messages": [
+  { "role": "user", "content": "Hello!" }
+] }
+```
+
+`model` is optional (`"auto"` picks the first file in `EXODUS_MODEL_DIR`). When a
+llama.cpp runtime is available (`EXODUS_LLAMA_BIN`, default `llama-cli`) and the
+model file is present, the node runs a real completion and returns
+`{"runtime": "llama.cpp", "reply": "…"}`. Otherwise it returns a truthful stub
+(`"runtime": "stub"`) explaining why inference is unavailable.
+
 ### Claim payload
 
 `POST /exodus/claims` accepts a JSON body:
@@ -154,6 +170,9 @@ All settings are read from environment variables prefixed with `EXODUS_`:
 | `EXODUS_DATA_DIR` | `~/.local/share/exodus` | Identity + ledger location |
 | `EXODUS_MODEL_DIR` | `<data_dir>/models` | Directory of local model files |
 | `EXODUS_GPU_LAYERS` | *(unset)* | Model layers to offload to the GPU |
+| `EXODUS_LLAMA_BIN` | `llama-cli` | llama.cpp CLI binary used for inference (`POST /exodus/chat`) |
+| `EXODUS_INFERENCE` | `true` | Enable chat inference; `0` returns the state stub |
+| `EXODUS_MAX_TOKENS` | `256` | Max generated tokens per chat reply |
 | `EXODUS_NODE_NAME` | `exodus-node` | Human-readable node name |
 | `EXODUS_NODE_HOST` | `0.0.0.0` | Gossip listen address |
 | `EXODUS_NODE_PORT` | `52514` | Gossip TCP port |
@@ -191,6 +210,13 @@ volumes. The node auto-detects an NVIDIA GPU wired in through the NVIDIA
 Container Toolkit (`deploy.resources.reservations.devices` in `docker-compose.yml`,
 or the legacy `gpus: all`) and reports it via `/exodus/models` and
 `/exodus/status`.
+
+The image bundles a prebuilt llama.cpp release (pinned in the `llamacpp` build
+stage) as `/opt/llama.cpp/llama-cli`, so `POST /exodus/chat` runs real
+inference as soon as a `.gguf` model file is present in the models volume.
+To switch the runtime backend, pass a different `LLAMA_ASSET` build arg (e.g.
+`llama-b10276-bin-ubuntu-vulkan-x64.tar.gz`); `EXODUS_LLAMA_BIN` overrides the
+binary path at runtime.
 
 ## Simulation
 
