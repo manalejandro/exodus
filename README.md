@@ -47,7 +47,8 @@ simulation mode.
 | `src/rewards.rs` | Credits, reward curve, decay, priority tiers, network report |
 | `src/network/` | `Transport` trait, TCP gossip, UDP discovery, in-process transport |
 | `src/api.rs` | axum REST API + SSE event stream |
-| `src/static/index.html` | Single-file web dashboard |
+| `src/static/index.html` | Single-file web chat (served at `/`) |
+| `src/static/dash.html` | Single-file web dashboard (served at `/exodus/dash.html`) |
 | `src/gpu.rs` | GPU detection and capability reporting |
 | `src/simulation.rs` | Headless multi-node simulation harness |
 | `src/config.rs` | `EXODUS_*` environment-based configuration |
@@ -96,7 +97,8 @@ exodus run [--data-dir DIR] [--node-host HOST] [--node-port PORT]
 
 ## REST API
 
-All endpoints are served under `/exodus`. The dashboard lives at `/`.
+All endpoints are served under `/exodus`. The chat UI lives at `/`, the
+dashboard at `/exodus/dash.html` (both single-file HTML, no external deps).
 
 | Method | Path | Description |
 | --- | --- | --- |
@@ -116,6 +118,7 @@ All endpoints are served under `/exodus`. The dashboard lives at `/`.
 | POST | `/exodus/network/peers` | Connect to a peer at runtime (`{"addr": "host:port"}`) |
 | GET | `/exodus/healthz` | Liveness + chain integrity probe |
 | GET | `/exodus/events` | SSE stream of block commits |
+| POST | `/exodus/chat` | Chat with the distributed model (`{"model": "…", "messages": […]}`) |
 
 ### Claim payload
 

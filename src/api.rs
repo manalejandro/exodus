@@ -62,6 +62,18 @@ struct UploadQuery {
     name: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    model: Option<String>,
+    messages: Vec<ChatMessage>,
+}
+
 // ------------------------------------------------------------------- handlers
 
 async fn status(State(c): State<Coord>) -> Json<Value> {
@@ -335,8 +347,85 @@ async fn events(State(c): State<Coord>) -> Sse<impl tokio_stream::Stream<Item = 
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// Chat with the distributed model.  This node does not bundle an inference
+/// runtime yet, so the reply is a structured stub reporting the model, GPU
+/// state and available model files; swap `chat_reply` for a real inference
+/// call once a runtime is attached.
+async fn chat(State(c): State<Coord>, Json(req): Json<ChatRequest>) -> impl IntoResponse {
+    if req.messages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no messages" })),
+        );
+    }
+    let model = match req.model.as_deref() {
+        Some(m) if safe_model_name(m) => m.to_string(),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid model name" })),
+            )
+        }
+        None => model_files(&c).into_iter().next().unwrap_or_else(|| "auto".to_string()),
+    };
+    let prompt = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    (StatusCode::OK, Json(chat_reply(&c, &model, &prompt)))
+}
+
+/// Names of the model files present in the models directory, sorted.
+fn model_files(c: &ExodusCoordinator) -> Vec<String> {
+    let dir = c.config.models_dir();
+    let mut files: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    safe_model_name(&name).then_some(name)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+fn chat_reply(c: &ExodusCoordinator, model: &str, prompt: &str) -> Value {
+    let gpu = c.gpu_info();
+    let files = model_files(c);
+    let present = files.iter().any(|f| f == model);
+    let absent = if present {
+        String::new()
+    } else {
+        format!(" (selected '{model}' is not present)")
+    };
+    json!({
+        "runtime": "stub",
+        "model": model,
+        "model_present": present,
+        "models": files,
+        "gpu": gpu.to_value(),
+        "reply": format!(
+            "[{model}] No inference runtime is bundled in this node yet, so I can't generate a real answer.\n\nNode state: {} ({}) with {} model file(s){absent}.\nReceived {} char(s) from the last message.",
+            if gpu.available { "GPU-ready" } else { "CPU-only" },
+            gpu.tier_string(),
+            files.len(),
+            prompt.chars().count(),
+        ),
+    })
+}
+
 async fn root() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("static/index.html"))
+}
+
+async fn dash() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("static/dash.html"))
 }
 
 // ------------------------------------------------------------------- server
@@ -345,6 +434,8 @@ async fn root() -> axum::response::Html<&'static str> {
 pub async fn serve(c: Coord, host: String, port: u16) {
     let app = Router::new()
         .route("/", get(root))
+        .route("/exodus/dash.html", get(dash))
+        .route("/exodus/chat", post(chat))
         .route("/exodus/status", get(status))
         .route("/exodus/credits", get(credits))
         .route("/exodus/network", get(network))
