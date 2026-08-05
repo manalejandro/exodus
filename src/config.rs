@@ -1,0 +1,130 @@
+//! Runtime configuration for an exodus node, overridable via `EXODUS_*`
+//! environment variables.  Ported from `exodus/config.py`.
+
+use std::env;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct ExodusConfig {
+    pub data_dir: PathBuf,
+    pub node_name: String,
+    pub model_dir: Option<PathBuf>,
+    pub gpu_layers: Option<i64>,
+
+    pub epoch_seconds: f64,
+    pub election_timeout_seconds: f64,
+    pub byzantine: bool,
+    pub max_faulty: Option<i64>,
+    pub claim_dedup_window: i64,
+    pub active_peer_window: i64,
+    pub heartbeat_seconds: f64,
+
+    pub node_host: String,
+    pub node_port: u16,
+    pub peers: Vec<String>,
+    pub discover: bool,
+    pub api_host: String,
+    pub api_port: u16,
+
+    pub flops_tolerance: f64,
+    pub credits_per_cu: f64,
+    pub reward_diminishing: f64,
+    pub credit_halflife_seconds: f64,
+    pub free_quota_seconds: f64,
+    pub seconds_per_credit: f64,
+    pub max_priority_levels: i64,
+}
+
+impl ExodusConfig {
+    pub fn identity_path(&self) -> PathBuf {
+        self.data_dir.join("identity.key")
+    }
+
+    pub fn ledger_path(&self) -> PathBuf {
+        self.data_dir.join("ledger.sqlite3")
+    }
+
+    pub fn models_dir(&self) -> PathBuf {
+        self.model_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("models"))
+    }
+}
+
+fn env_str(name: &str, default: &str) -> String {
+    env::var(format!("EXODUS_{name}")).unwrap_or_else(|_| default.to_string())
+}
+fn env_int(name: &str, default: i64) -> i64 {
+    env_str(name, &default.to_string()).parse().unwrap_or(default)
+}
+fn env_float(name: &str, default: f64) -> f64 {
+    env_str(name, &default.to_string()).parse().unwrap_or(default)
+}
+fn env_bool(name: &str, default: bool) -> bool {
+    let v = env_str(name, if default { "true" } else { "false" })
+        .trim()
+        .to_lowercase();
+    matches!(v.as_str(), "1" | "true" | "yes" | "on")
+}
+fn env_int_optional(name: &str) -> Option<i64> {
+    let v = env_str(name, "").trim().to_string();
+    if v.is_empty() {
+        return None;
+    }
+    v.parse().ok()
+}
+fn env_list(name: &str, default: Vec<String>) -> Vec<String> {
+    let v = env_str(name, "").trim().to_string();
+    if v.is_empty() {
+        return default;
+    }
+    v.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn default_data_dir() -> PathBuf {
+    let base = env::var("XDG_DATA_HOME").unwrap_or_else(|_| "~/.local/share".to_string());
+    // expand a leading `~`
+    if let Some(rest) = base.strip_prefix("~/") {
+        let home = env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        return PathBuf::from(home).join(rest).join("exodus");
+    }
+    PathBuf::from(base).join("exodus")
+}
+
+/// Build a config from the environment (with optional overrides).
+pub fn config_from_env() -> ExodusConfig {
+    let data_dir = env::var("EXODUS_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_data_dir());
+    let model_dir = env::var("EXODUS_MODEL_DIR").ok().filter(|s| !s.trim().is_empty());
+
+    ExodusConfig {
+        data_dir,
+        node_name: env_str("NODE_NAME", "exodus-node"),
+        model_dir: model_dir.map(PathBuf::from),
+        gpu_layers: env_int_optional("GPU_LAYERS"),
+        epoch_seconds: env_float("EPOCH_SECONDS", 30.0),
+        election_timeout_seconds: env_float("ELECTION_TIMEOUT_SECONDS", 90.0),
+        byzantine: env_bool("BYZANTINE", true),
+        max_faulty: None,
+        claim_dedup_window: env_int("CLAIM_DEDUP_WINDOW", 256),
+        active_peer_window: env_int("ACTIVE_PEER_WINDOW", 5),
+        heartbeat_seconds: env_float("HEARTBEAT_SECONDS", 10.0),
+        node_host: env_str("NODE_HOST", "0.0.0.0"),
+        node_port: env_int("NODE_PORT", 52514) as u16,
+        peers: env_list("PEERS", Vec::new()),
+        discover: env_bool("DISCOVER", true),
+        api_host: env_str("API_HOST", "127.0.0.1"),
+        api_port: env_int("API_PORT", 52515) as u16,
+        flops_tolerance: env_float("FLOPS_TOLERANCE", 0.5),
+        credits_per_cu: env_float("CREDITS_PER_CU", 0.01),
+        reward_diminishing: env_float("REWARD_DIMINISHING", 0.85),
+        credit_halflife_seconds: env_float("CREDIT_HALFLIFE_SECONDS", 30.0 * 24.0 * 3600.0),
+        free_quota_seconds: env_float("FREE_QUOTA_SECONDS", 300.0),
+        seconds_per_credit: env_float("SECONDS_PER_CREDIT", 60.0),
+        max_priority_levels: env_int("MAX_PRIORITY_LEVELS", 5),
+    }
+}

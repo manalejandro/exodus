@@ -1,54 +1,70 @@
-# exodus — a single-node stack: the consensus node plus a read-only API.
-#
-#   docker compose up -d          # build + start node and api
-#   curl http://127.0.0.1:52515/exodus/status
-#
-# The node and the api share one /data volume (identity + SQLite ledger).
-# The api only reads the ledger; it starts after the node is healthy so the
-# genesis block is guaranteed to exist.  Note: multi-node networking is not
-# wired up yet — the bundled transport is in-process (LocalTransport).  When a
-# real network transport lands (ZenohBridgeTransport), point several nodes at
-# the same pub/sub broker instead of one container.
-
 services:
-  exodus:
-    build: .
+  node:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: exodus:latest
     container_name: exodus-node
     restart: unless-stopped
+
+    # ---- GPU support ------------------------------------------------------
+    # Requires the NVIDIA Container Toolkit on the host:
+    #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit
+    #
+    # Legacy alternative: add `gpus: all` here instead of the deploy block.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # ---- networking -------------------------------------------------------
+    ports:
+      - "52513:52513/udp"   # multicast discovery
+      - "52514:52514/tcp"   # node gossip
+      - "52515:52515/tcp"   # REST API + dashboard
+
+    # ---- persistent state -------------------------------------------------
     volumes:
-      - exodus-data:/data
+      - exodus-data:/data       # identity.key + ledger.sqlite3
+      - exodus-models:/models   # local model files
+
+    # ---- node configuration ------------------------------------------------
     environment:
-      # Protocol tunables — see docs/protocol.md
-      EXODUS_EPOCH_SECONDS: "30"
-      EXODUS_ELECTION_TIMEOUT_SECONDS: "90"
-      EXODUS_HEARTBEAT_SECONDS: "10"
-      EXODUS_BYZANTINE: "true"
-      # Reward tunables — see docs/incentives.md
-      EXODUS_CREDITS_PER_CU: "0.01"
-      EXODUS_REWARD_DIMINISHING: "0.85"
-      EXODUS_FREE_QUOTA_SECONDS: "300"
-      EXODUS_SECONDS_PER_CREDIT: "60"
+      EXODUS_NODE_NAME: exodus-node
+      # EXODUS_NODE_HOST: "0.0.0.0"        # override bind address
+      # EXODUS_NODE_PORT: "52514"          # override gossip port
+      # EXODUS_API_HOST: "0.0.0.0"         # override API bind address
+      # EXODUS_API_PORT: "52515"           # override API port
+      EXODUS_DISCOVER: "true"              # UDP multicast peer discovery
+      # EXODUS_PEERS: "node2:52514,node3:52514"  # static bootstrap peers
+      # GPU / inference tuning.  The node auto-detects the NVIDIA GPU wired in
+      # by the toolkit (nvidia-smi / NVIDIA_VISIBLE_DEVICES) and advertises it
+      # on /exodus/models and /exodus/status.  EXODUS_GPU_LAYERS sets how many
+      # model layers are offloaded when a runtime uses the detected GPU.
+      EXODUS_GPU_LAYERS: "35"               # layers offloaded to the GPU
+      EXODUS_MODEL_DIR: "/models"           # where model files live
+
     healthcheck:
-      test: ["CMD", "exodus", "status"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:52515/exodus/healthz || exit 1"]
       interval: 30s
       timeout: 5s
-      retries: 3
+      retries: 5
       start_period: 10s
 
-  api:
-    build: .
+    stop_grace_period: 30s
+
+  # One-off sanity check: runs the deterministic 5-node simulation.
+  simulate:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: exodus:latest
-    container_name: exodus-api
-    restart: unless-stopped
-    depends_on:
-      exodus:
-        condition: service_healthy
-    ports:
-      - "52515:52515"
-    volumes:
-      - exodus-data:/data
-    command: ["api", "--host", "0.0.0.0", "--port", "52515"]
+    profiles: ["simulate"]
+    command: ["exodus", "simulate"]
 
 volumes:
   exodus-data:
+  exodus-models:

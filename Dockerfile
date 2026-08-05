@@ -1,31 +1,51 @@
 # syntax=docker/dockerfile:1
-FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    XDG_DATA_HOME=/data
+# ---- builder -------------------------------------------------------------
+FROM rust:1.97-bookworm AS builder
+WORKDIR /build
 
-WORKDIR /app
+# rusqlite ("bundled") compiles SQLite from source -> needs a C toolchain.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install the exodus package with the API extra (fastapi + uvicorn).
-# Layer cached by copying only the build inputs first.
-COPY pyproject.toml README.md LICENSE ./
+COPY Cargo.toml ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[api]"
+RUN cargo build --release
 
-# Non-root runtime user.  /data holds the node identity + SQLite ledger and is
-# meant to be mounted as a volume.
-RUN useradd --create-home --uid 1000 exodus \
-    && mkdir -p /data \
-    && chown -R exodus:exodus /data
+# ---- runtime -------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && adduser --disabled-password --gecos "" --home /home/exodus exodus
+
+COPY --from=builder /build/target/release/exodus /usr/local/bin/exodus
+
+# The node is CPU-only today; NVIDIA_* vars are provided so the container is
+# ready for GPU inference once the runtime uses the device (the driver libs are
+# injected automatically by the NVIDIA Container Toolkit / `gpus:` in compose).
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+
+ENV EXODUS_DATA_DIR=/data \
+    EXODUS_MODEL_DIR=/models \
+    EXODUS_NODE_NAME=exodus-node \
+    EXODUS_NODE_HOST=0.0.0.0 \
+    EXODUS_NODE_PORT=52514 \
+    EXODUS_API_HOST=0.0.0.0 \
+    EXODUS_API_PORT=52515
+
+RUN mkdir -p /data /models && chown -R exodus:exodus /data /models
 
 USER exodus
+WORKDIR /home/exodus
 
-VOLUME /data
-EXPOSE 52515
+# UDP multicast discovery / TCP gossip / REST API
+EXPOSE 52513/udp 52514/tcp 52515/tcp
 
-# `exodus run` starts the node loop; override with e.g. `exodus api` or
-# `exodus status` (also used by the compose healthcheck).
-ENTRYPOINT ["exodus"]
-CMD ["run"]
+VOLUME ["/data", "/models"]
+
+ENTRYPOINT ["tini", "--"]
+CMD ["exodus", "run", "--api"]

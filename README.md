@@ -2,115 +2,215 @@
 
 **Free, non-profit, open distributed compute network.**
 
-exodus builds on the [exo](https://github.com/exo-explore/exo) project so that
-anyone can share their idle GPU/CPU/RAM with a global network that runs AI
-models **for free**. Nodes agree on who contributed what through a lightweight
-distributed consensus protocol ("Proof-of-Contribution"), record the agreement
-in an append-only, hash-chained ledger, and reward contributors with
-**extra AI time** — priority scheduling and a larger concurrency quota on the
-shared pool. No money, no tokens, no ads.
+exodus is a distributed compute network where nodes contribute inference
+compute, submit verifiable contribution claims, earn credits for their work,
+and maintain a single tamper-evident ledger through Byzantine-fault-tolerant
+consensus.
 
-- **Free to use.** The pool is open; every participant starts each day with a
-  base inference budget.
-- **Fair to keepers.** Contribute compute and you earn higher priority and
-  more concurrency when the network is busy.
-- **Deterministic and auditable.** Any node can replay the ledger and verify
-  every block, every claim, and every reward — there is nothing to trust.
-- **Simple by design.** A small, self-contained Python package. The core
-  depends only on `pydantic`, `anyio`, `cryptography`, and `loguru`; exo
-  itself is optional and only touched through lazy integration hooks.
+This repository contains the reference node implementation in **Rust**, a
+faithful port of the original Python prototype. It ships as a single `exodus`
+binary with a REST API, a web dashboard, GPU detection, and a deterministic
+simulation mode.
+
+## Features
+
+- **Identity** — Ed25519 keypairs (`ed25519-dalek`); node ids are
+  `exd` + base32 (lowercase, no padding) of the first 16 bytes of
+  `sha256(public_key)`.
+- **Tamper-evident ledger** — append-only SQLite chain (`rusqlite`) where every
+  block is cryptographically chained: `block_hash = sha256(proposal_hash +
+  canonical_json(signatures))`.
+- **BFT consensus** — view-based sealer rotation, proposals, signature shares
+  and commit messages with a `2f+1` Byzantine quorum or simple majority mode.
+- **Credits & rewards** — compute-unit accounting, a diminishing reward curve,
+  credit half-life decay, priority tiers and fair scheduling quotas.
+- **Networking** — length-prefixed JSON frames over TCP gossip with
+  message-id dedup and forwarding, plus UDP multicast peer discovery.
+- **REST API + SSE + dashboard** — axum-based API, a live event stream, and a
+  self-contained single-file web dashboard (no external dependencies).
+- **GPU support** — automatic NVIDIA GPU detection (`nvidia-smi`, container
+  hints, `EXODUS_GPU_LAYERS`) reported through the API and used to tag
+  contributions with the correct device tier.
+- **Deterministic simulation** — run many nodes headless in one process to
+  validate consensus and ledger convergence.
+- **Docker** — multi-stage image and `docker-compose` with NVIDIA GPU
+  passthrough for the container runtime.
+
+## Architecture
+
+| Path | Purpose |
+| --- | --- |
+| `src/identity.rs` | Ed25519 identity, node-id derivation, key management |
+| `src/ledger.rs` | SQLite chain store, block hashing, chain verification |
+| `src/consensus/` | BFT consensus protocol, claim/proposal validation, topics |
+| `src/accounting.rs` | FLOPS plausibility checks, compute-unit calculation |
+| `src/rewards.rs` | Credits, reward curve, decay, priority tiers, network report |
+| `src/network/` | `Transport` trait, TCP gossip, UDP discovery, in-process transport |
+| `src/api.rs` | axum REST API + SSE event stream |
+| `src/static/index.html` | Single-file web dashboard |
+| `src/gpu.rs` | GPU detection and capability reporting |
+| `src/simulation.rs` | Headless multi-node simulation harness |
+| `src/config.rs` | `EXODUS_*` environment-based configuration |
 
 ## Quick start
 
-```bash
-pip install -e .            # or: pip install -e ".[dev]" for tests
-exodus init                 # create your identity + data dir
-exodus status               # node id, ledger height, credits, AI time
-exodus simulate             # run a 5-node headless simulation
-exodus api --port 52515     # serve the REST API (curl http://127.0.0.1:52515/exodus/status)
+Requirements: a recent stable Rust toolchain (a C toolchain is needed for the
+bundled SQLite).
+
+```sh
+cargo build --release
+
+# create your identity + data directory
+./target/release/exodus init
+
+# show the effective configuration
+./target/release/exodus config
+
+# print node status
+./target/release/exodus status
+
+# join the network as a full node with the API + dashboard
+./target/release/exodus run --api
+#   -> REST API:  http://127.0.0.1:52515/exodus/status
+#   -> dashboard: http://127.0.0.1:52515/
 ```
 
-A single-node run:
+Connect multiple nodes by passing `--peer host:port` (or `EXODUS_PEERS`) and
+keep discovery enabled, e.g.:
 
-```bash
-exodus run
+```sh
+./target/release/exodus run --api --peer 192.168.1.20:52514 --peer 192.168.1.21:52514
 ```
 
-## How it works (in one paragraph)
+## CLI
 
-When an exo worker finishes a generation, it attests the measured tokens,
-model, precision and time as a signed *contribution claim*. Claims are gossiped
-around the network. Every `epoch_seconds` (default 30 s) the current *sealer* —
-a node chosen deterministically from the recent chain — bundles the pending
-claims into a *checkpoint proposal*. Validators verify it (signatures, FLOPS
-sanity, duplicate/sequence rules) and broadcast signature shares; once the
-quorum is reached the checkpoint is committed to every node's append-only,
-hash-chained SQLite ledger. Rewards are a *pure function of the committed
-ledger*: each node replays the chain and derives verified Compute Units (CU),
-credits, decay, and the resulting priority tier. See
-[docs/](docs/architecture.md) for the details.
-
-## Docs
-
-| Document | What it covers |
-| --- | --- |
-| [docs/architecture.md](docs/architecture.md) | Components, data model, lifecycle |
-| [docs/protocol.md](docs/protocol.md) | The Proof-of-Contribution consensus protocol |
-| [docs/incentives.md](docs/incentives.md) | Compute Units, credits, AI time, decay |
-| [docs/api.md](docs/api.md) | REST API, CLI, and Python API |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, testing, and contributing |
-
-## Examples
-
-- [examples/quickstart.py](examples/quickstart.py) — scripted two-node network
-  in one process
-- [examples/exo_hooks.py](examples/exo_hooks.py) — wiring exodus into an exo
-  FastAPI app and worker
-
-## Deployment (Docker)
-
-```bash
-docker compose up -d          # build + start node and API
-curl http://127.0.0.1:52515/exodus/status
-docker compose down           # stop; the ledger persists in the exodus-data volume
+```
+exodus init                              create your identity + data dir
+exodus config                            show the effective runtime configuration
+exodus status [--data-dir DIR] [--json]  print node status
+exodus simulate [--nodes N] [--ticks T]
+               [--seed S] [--claims-per-tick C]   run a headless simulation
+exodus run [--data-dir DIR] [--node-host HOST] [--node-port PORT]
+           [--peer HOST:PORT]... [--no-discover] [--api]
 ```
 
-- The `exodus` service runs the node (`exodus run`) with `/data` mounted as a
-  volume holding the identity and the SQLite ledger.
-- The `api` service serves the REST API on port 52515 and reads the same
-  ledger (it starts only after the node is healthy).
-- Override protocol/reward tunables via the `EXODUS_*` environment variables
-  in the compose file (see [docs/protocol.md](docs/protocol.md) and
-  [docs/incentives.md](docs/incentives.md)).
+## REST API
+
+All endpoints are served under `/exodus`. The dashboard lives at `/`.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/exodus/status` | Node, ledger, consensus and GPU status |
+| GET | `/exodus/credits` | Local node credit entitlement |
+| GET | `/exodus/network` | Participants and reward parameters |
+| GET | `/exodus/consensus` | View, sealer, committee and peers |
+| GET | `/exodus/nodes` | Network participants |
+| GET | `/exodus/rewards` | Reward parameters |
+| GET | `/exodus/ledger?limit=N` | Recent blocks (default 20, max 500) |
+| GET | `/exodus/ledger/verify` | Full chain verification |
+| GET | `/exodus/claims?node_id=ID` | Claims, optionally filtered by node |
+| POST | `/exodus/claims` | Submit an inference contribution claim |
+| GET | `/exodus/models` | GPU status + model files in the model directory |
+| POST | `/exodus/models/upload?name=FILE` | Upload a model file (raw body) |
+| DELETE | `/exodus/models/{name}` | Delete a model file |
+| POST | `/exodus/network/peers` | Connect to a peer at runtime (`{"addr": "host:port"}`) |
+| GET | `/exodus/healthz` | Liveness + chain integrity probe |
+| GET | `/exodus/events` | SSE stream of block commits |
+
+### Claim payload
+
+`POST /exodus/claims` accepts a JSON body:
+
+```json
+{
+  "model_id": "llama-3b.gguf",
+  "params_b": 3,
+  "precision": "int4",
+  "prompt_tokens": 512,
+  "completion_tokens": 128,
+  "compute_seconds": 12.5,
+  "flops_estimate": 1.9e12,
+  "device_tier": "gpu_nvidia",
+  "work_type": "text_generation",
+  "started_at": "2026-08-05T00:00:00Z",
+  "ended_at": "2026-08-05T00:00:12Z"
+}
+```
+
+`device_tier` and `work_type` are optional; if omitted, `device_tier`
+defaults to the tier detected from the local hardware (`cpu` or `gpu_nvidia`)
+and `work_type` to `text_generation`. Claims must pass the FLOPS plausibility
+check (see `src/accounting.rs`).
+
+## Configuration
+
+All settings are read from environment variables prefixed with `EXODUS_`:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `EXODUS_DATA_DIR` | `~/.local/share/exodus` | Identity + ledger location |
+| `EXODUS_MODEL_DIR` | `<data_dir>/models` | Directory of local model files |
+| `EXODUS_GPU_LAYERS` | *(unset)* | Model layers to offload to the GPU |
+| `EXODUS_NODE_NAME` | `exodus-node` | Human-readable node name |
+| `EXODUS_NODE_HOST` | `0.0.0.0` | Gossip listen address |
+| `EXODUS_NODE_PORT` | `52514` | Gossip TCP port |
+| `EXODUS_API_HOST` | `127.0.0.1` | API listen address |
+| `EXODUS_API_PORT` | `52515` | API port |
+| `EXODUS_PEERS` | *(empty)* | Comma-separated bootstrap peers `host:port` |
+| `EXODUS_DISCOVER` | `true` | Enable UDP multicast discovery |
+| `EXODUS_EPOCH_SECONDS` | `30` | Checkpoint/commit period |
+| `EXODUS_ELECTION_TIMEOUT_SECONDS` | `90` | Leader-election timeout |
+| `EXODUS_HEARTBEAT_SECONDS` | `10` | Heartbeat interval |
+| `EXODUS_BYZANTINE` | `true` | `2f+1` quorum (else simple majority) |
+| `EXODUS_CLAIM_DEDUP_WINDOW` | `256` | Claim dedup cache size |
+| `EXODUS_ACTIVE_PEER_WINDOW` | `5` | Heartbeats before a peer is considered active |
+| `EXODUS_FLOPS_TOLERANCE` | `0.5` | Allowed FLOPS deviation |
+| `EXODUS_CREDITS_PER_CU` | `0.01` | Credits per compute unit |
+| `EXODUS_REWARD_DIMINISHING` | `0.85` | Reward curve exponent |
+| `EXODUS_CREDIT_HALFLIFE_SECONDS` | `2592000` | Credit decay half-life |
+| `EXODUS_FREE_QUOTA_SECONDS` | `300` | Free AI-time quota per day |
+| `EXODUS_SECONDS_PER_CREDIT` | `60` | AI-time seconds per credit |
+| `EXODUS_MAX_PRIORITY_LEVELS` | `5` | Number of priority tiers |
+
+## Docker
+
+```sh
+# build and run the node with the API + dashboard
+docker compose up -d --build node
+
+# run the deterministic simulation as a one-off
+docker compose --profile simulate run --rm simulate
+```
+
+The compose file exposes UDP `52513` (discovery), TCP `52514` (gossip) and TCP
+`52515` (API), and persists state in the `exodus-data` and `exodus-models`
+volumes. The node auto-detects an NVIDIA GPU wired in through the NVIDIA
+Container Toolkit (`deploy.resources.reservations.devices` in `docker-compose.yml`,
+or the legacy `gpus: all`) and reports it via `/exodus/models` and
+`/exodus/status`.
+
+## Simulation
+
+A deterministic headless run exercises consensus and ledger convergence across
+N nodes without sockets:
+
+```sh
+./target/release/exodus simulate
+# simulation: 5 nodes x 40 ticks -> 41 blocks, 80 claims, 1543.95 CU, ledgers consistent: true
+```
+
+Pass `--seed` for reproducibility, or tune `--nodes`, `--ticks` and
+`--claims-per-tick`.
 
 ## Development
 
-```bash
-pip install -e ".[dev]"
-pytest -q          # 59 tests: crypto, ledger, consensus, rewards, API, simulation
-ruff check src tests
-python -m exodus simulate --nodes 5 --ticks 40 --seed 42
-```
-
-## Project layout
-
-```
-src/exodus/
-  crypto.py           Ed25519 signing, hashing, canonical JSON, node ids
-  identity.py         persistent key pair (identity.key, 0600)
-  config.py           ExodusConfig + EXODUS_* environment tunables
-  coordinator.py      per-node runtime bundle (submit, query, run loop)
-  consensus/          Proof-of-Contribution protocol + validation
-  contrib/            contribution claims and compute-unit accounting
-  ledger/             append-only hash-chained SQLite chain
-  rewards/            credits -> extra AI time, tiers, decay
-  network/            pub/sub Transport abstraction + in-process transport
-  api/                FastAPI router (standalone or mounted into exo)
-  integration/        lazy exo adapters: API mount, worker hook, zenoh bridge
-  simulation/         headless multi-node simulation harness
+```sh
+cargo build      # build (debug)
+cargo test       # unit + integration tests
+cargo clippy     # lints
+cargo run -- simulate
 ```
 
 ## License
 
-Apache-2.0. This project is an independent implementation and is not affiliated
-with the exo project; upstream exo code retains its own license.
+[MIT](LICENSE)

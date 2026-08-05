@@ -1,27 +1,4 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-.eggs/
-
-# Virtual environments
-.venv/
-venv/
-
-# Tooling caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-htmlcov/
-
-# Node data (identity keys and ledgers) must never be committed
-*.identity.key
-ledger.sqlite3
-exodus-home/
-
-# OS / editor noise
-.DS_Store
-*.swp
+/target
+Cargo.lock
+*.sqlite3
+/tests-bin
