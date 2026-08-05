@@ -462,8 +462,10 @@ drop.addEventListener("drop", (e) => {
 // ---- peer connect ----
 $("peerform").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const btn = $("peerform").querySelector("button");
   const msg = $("peer-msg");
-  msg.className = "flash"; msg.textContent = "connecting…";
+  msg.className = "flash"; msg.textContent = "requesting…";
+  btn.disabled = true;
   try {
     const r = await api("network/peers", {
       method: "POST",
@@ -471,8 +473,11 @@ $("peerform").addEventListener("submit", async (e) => {
       body: JSON.stringify({ addr: $("peer-addr").value.trim() }),
     });
     msg.className = "flash ok"; msg.textContent = r.message;
+    setTimeout(() => loadNetwork().catch(() => {}), 1500);
   } catch (err) {
-    msg.className = "flash err"; msg.textContent = err.message;
+    msg.className = "flash err"; msg.textContent = "error: " + err.message;
+  } finally {
+    btn.disabled = false;
   }
 });
 

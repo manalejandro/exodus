@@ -31,10 +31,12 @@ pub trait Transport: Send + Sync {
     fn running(&self) -> bool;
 
     /// Request that this transport connect to another node at `host:port`.
-    /// Returns `Err` if the transport is not running.  The default is a no-op
-    /// for transports that are not addressable at runtime (e.g. in-process).
-    fn connect_peer(&self, _addr: String) -> Result<(), TransportError> {
-        Ok(())
+    /// Returns a status message (e.g. `connecting to …`, `already connected
+    /// to …`) on success, or `Err` if the transport is not running or the
+    /// address is invalid (e.g. this node's own address).  The default is a
+    /// no-op for transports that are not addressable at runtime.
+    fn connect_peer(&self, addr: String) -> Result<String, TransportError> {
+        Ok(format!("connecting to {addr}"))
     }
 }
 

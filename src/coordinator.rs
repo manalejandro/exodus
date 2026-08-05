@@ -264,13 +264,11 @@ impl ExodusCoordinator {
         self.rewards.network_report(&self.store)
     }
 
-    /// Ask the transport to connect to `host:port`.  Returns the address on
-    /// success, or an error string if the transport cannot connect at runtime.
+    /// Ask the transport to connect to `host:port`.  Returns a status message
+    /// (e.g. "connecting to …", "already connected to …") on success, or an
+    /// error string when the address is invalid.
     pub fn connect_peer(&self, addr: &str) -> Result<String, String> {
-        self.transport
-            .connect_peer(addr.to_string())
-            .map_err(|e| e.0)?;
-        Ok(format!("connecting to {addr}"))
+        self.transport.connect_peer(addr.to_string()).map_err(|e| e.0)
     }
 
     pub fn ledger_summary(&self, limit: usize) -> Value {

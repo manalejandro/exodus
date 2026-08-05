@@ -76,14 +76,22 @@ impl Inner {
         }
     }
 
-    fn on_frame(&self, frame: &Value, sender_key: &str) {
+    /// Process one inbound frame.  Returns `false` when the frame originated
+    /// from ourselves, signalling the reader to drop the connection (a
+    /// self-connection guard for connects made via the public IP).
+    fn on_frame(&self, frame: &Value, sender_key: &str) -> bool {
+        if let Some(origin) = frame.get("f").and_then(|v| v.as_str()) {
+            if origin == self.node_id {
+                return false;
+            }
+        }
         if let Some(id) = frame.get("i").and_then(|v| v.as_str()) {
             if self.note_seen(id) {
-                return;
+                return true;
             }
         }
         let Some(topic) = frame.get("t").and_then(|v| v.as_str()).map(str::to_string) else {
-            return;
+            return true;
         };
         let payload = frame
             .get("p")
@@ -103,6 +111,7 @@ impl Inner {
         for tx in senders {
             let _ = tx.send(raw.clone());
         }
+        true
     }
 
     fn broadcast(&self, raw: Vec<u8>) {
@@ -258,7 +267,23 @@ impl Transport for TcpTransport {
         self.inner.runtime.lock().unwrap().is_some()
     }
 
-    fn connect_peer(&self, addr: String) -> Result<(), TransportError> {
+    fn connect_peer(&self, addr: String) -> Result<String, TransportError> {
+        let own = format!("{}:{}", self.host, self.port);
+        let self_addrs = [
+            own,
+            format!("127.0.0.1:{}", self.port),
+            format!("localhost:{}", self.port),
+        ];
+        if self_addrs.iter().any(|a| a == &addr) {
+            return Err(TransportError(format!("{addr} is this node's own address")));
+        }
+        if self.inner.peers.lock().unwrap().contains_key(&addr) {
+            return Ok(format!("already connected to {addr}"));
+        }
+        let mut manual = self.manual_peers.lock().unwrap();
+        if manual.contains_key(&addr) {
+            return Ok(format!("connection to {addr} already in progress"));
+        }
         let rt = self
             .inner
             .runtime
@@ -266,14 +291,11 @@ impl Transport for TcpTransport {
             .unwrap()
             .clone()
             .ok_or_else(|| TransportError("transport is not running".into()))?;
-        let mut manual = self.manual_peers.lock().unwrap();
-        if manual.contains_key(&addr) {
-            return Ok(());
-        }
         manual.insert(addr.clone(), ());
         let inner = self.inner.clone();
-        drop(rt.spawn(async move { connect_loop(inner, addr).await }));
-        Ok(())
+        let connect_addr = addr.clone();
+        drop(rt.spawn(async move { connect_loop(inner, connect_addr).await }));
+        Ok(format!("connecting to {addr}"))
     }
 }
 
@@ -316,7 +338,9 @@ async fn read_loop(reader: &mut tokio::net::tcp::OwnedReadHalf, key: &str, inner
         let Ok(frame) = serde_json::from_slice::<Value>(&body) else {
             continue;
         };
-        inner.on_frame(&frame, key);
+        if !inner.on_frame(&frame, key) {
+            break;
+        }
     }
 }
 
