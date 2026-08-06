@@ -8,7 +8,7 @@
 //! lock, compute, drain and finally flush publishes outside the lock so that a
 //! synchronous in-process transport cannot deadlock us.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 
@@ -46,10 +46,17 @@ struct ProtocolState {
     peers: HashMap<String, Heartbeat>,
     pending_commits: BTreeMap<i64, Checkpoint>,
     recent_fork_alerts: HashSet<String>,
+    recent_commit_rejects: VecDeque<String>,
 
     outgoing: Vec<(String, Message)>,
     listener_calls: Vec<(i64, String)>,
 }
+
+/// Bounded cap for the recently-rejected commit ring.  Blocks whose quorum is
+/// insufficient today keep being re-delivered by peers while their height can
+/// never advance locally; without this ring the same rejection would be logged
+/// (and re-validated) on every redelivery, forever.
+const MAX_RECENT_COMMIT_REJECTS: usize = 512;
 
 pub struct ConsensusProtocol {
     pub node_id: String,
@@ -171,6 +178,7 @@ impl ConsensusProtocol {
                 peers: HashMap::new(),
                 pending_commits: BTreeMap::new(),
                 recent_fork_alerts: HashSet::new(),
+                recent_commit_rejects: VecDeque::new(),
                 outgoing: Vec::new(),
                 listener_calls: Vec::new(),
             }),
@@ -650,6 +658,9 @@ impl ProtocolState {
                 return;
             }
         }
+        if self.commit_reject_seen(&checkpoint.block_hash()) {
+            return;
+        }
         let mut seen = self.committed_claim_ids.clone();
         if let Err(e) = validate_checkpoint(
             &checkpoint,
@@ -659,12 +670,31 @@ impl ProtocolState {
             false,
             Some(&mut seen),
         ) {
+            self.note_commit_reject(&checkpoint.block_hash());
             eprintln!("rejecting commit: {e}");
             return;
         }
         self.committed_claim_ids = seen;
         self.commit_local(&checkpoint, store);
         self.flush_pending_commits(store, config);
+    }
+
+    /// True when this exact commit has already been rejected once in a recent
+    /// window.  Used to swallow re-deliveries of an invalid commit (e.g. a block
+    /// whose quorum can never be met locally) instead of re-validating and
+    /// re-logging it on every delivery, forever.
+    fn commit_reject_seen(&self, hash: &str) -> bool {
+        self.recent_commit_rejects.iter().any(|h| h == hash)
+    }
+
+    fn note_commit_reject(&mut self, hash: &str) {
+        if self.commit_reject_seen(hash) {
+            return;
+        }
+        self.recent_commit_rejects.push_back(hash.to_string());
+        while self.recent_commit_rejects.len() > MAX_RECENT_COMMIT_REJECTS {
+            self.recent_commit_rejects.pop_front();
+        }
     }
 
     fn flush_pending_commits(&mut self, store: &ChainStore, config: &ExodusConfig) {
@@ -978,6 +1008,7 @@ mod tests {
             peers: HashMap::new(),
             pending_commits: BTreeMap::new(),
             recent_fork_alerts: HashSet::new(),
+            recent_commit_rejects: VecDeque::new(),
             outgoing: Vec::new(),
             listener_calls: Vec::new(),
         }
@@ -1047,5 +1078,59 @@ mod tests {
 
         assert_eq!(store.height(), 1);
         assert_eq!(store.head().unwrap().block_hash(), block_a.block_hash());
+    }
+
+    #[test]
+    fn repeated_insufficient_quorum_commit_is_suppressed() {
+        let store = temp_store();
+        let genesis = store.head().unwrap();
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        let mut state = test_state(&store);
+        state.node_id = crate::crypto::node_id_from_public_key(&public_key);
+        state.private_key = private_key.to_vec();
+
+        // The committee is just this node, so quorum is 1; a block with zero
+        // quorum signatures can never meet it locally and is rejected.
+        let claim = signed_claim(1);
+        let proposal = CheckpointProposal {
+            epoch: 1,
+            height: 1,
+            prev_hash: genesis.block_hash(),
+            sealed_by: state.node_id.clone(),
+            claims: vec![claim],
+            created_at: utcnow_iso(),
+        };
+        let bad = Checkpoint { proposal, signatures: Vec::new() };
+        let hash = bad.block_hash();
+
+        // First delivery: rejected (and remembered).
+        state.on_commit(CommitMessage { checkpoint: bad.clone() }, &store, &config_from_env());
+        assert_eq!(store.height(), 0);
+        assert!(state.commit_reject_seen(&hash));
+
+        // Redelivery of the same block is swallowed: no re-validation, no more
+        // log spam, and the history still cannot advance on top of it.
+        let before = state.recent_commit_rejects.len();
+        state.on_commit(CommitMessage { checkpoint: bad }, &store, &config_from_env());
+        assert_eq!(store.height(), 0);
+        assert_eq!(state.recent_commit_rejects.len(), before);
+    }
+
+    #[test]
+    fn valid_commit_is_not_suppressed_by_recent_rejects() {
+        let store = temp_store();
+        let genesis = store.head().unwrap();
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        let mut state = test_state(&store);
+        state.node_id = crate::crypto::node_id_from_public_key(&public_key);
+        state.private_key = private_key.to_vec();
+
+        let claim = signed_claim(1);
+        let good = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim]);
+        state.on_commit(CommitMessage { checkpoint: good }, &store, &config_from_env());
+
+        // A different, validly-quorummed block must still commit normally.
+        assert_eq!(store.height(), 1);
+        assert!(state.recent_commit_rejects.is_empty());
     }
 }
