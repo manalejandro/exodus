@@ -120,6 +120,24 @@ fn quorum_size(state: &ProtocolState, store: &ChainStore, config: &ExodusConfig)
     }
 }
 
+/// Deepest height at which the local chain and the peer's chain agree, or `-1`
+/// when the divergence starts before any stored block (only genesis precedes it).
+fn common_ancestor(store: &ChainStore, peer: &[Checkpoint]) -> i64 {
+    let local_height = store.height();
+    for h in (0..=local_height).rev() {
+        let Some(local) = store.get_block(h) else {
+            continue;
+        };
+        let peer_has = peer
+            .iter()
+            .any(|b| b.height() == h && b.block_hash() == local.block_hash());
+        if peer_has {
+            return h;
+        }
+    }
+    -1
+}
+
 impl ConsensusProtocol {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -611,6 +629,27 @@ impl ProtocolState {
             ));
             return;
         }
+        // A block exactly one past our head that is built on a *different*
+        // parent is a fork where the peer is ahead of us (its chain is longer).
+        // Fetch the peer's full chain once so reconcile_chain can roll us back
+        // to the common ancestor and adopt it, instead of rejecting forever.
+        if let Some(h) = head.as_ref() {
+            if checkpoint.height() == h.height() + 1
+                && checkpoint.proposal.prev_hash != h.block_hash()
+            {
+                let key = format!("{}{}", h.block_hash(), checkpoint.proposal.prev_hash);
+                if self.recent_fork_alerts.insert(key) {
+                    self.outgoing.push((
+                        topics::SYNC.to_string(),
+                        Message::SyncRequest(SyncRequest {
+                            node_id: self.node_id.clone(),
+                            from_height: -1,
+                        }),
+                    ));
+                }
+                return;
+            }
+        }
         let mut seen = self.committed_claim_ids.clone();
         if let Err(e) = validate_checkpoint(
             &checkpoint,
@@ -724,9 +763,70 @@ impl ProtocolState {
     }
 
     fn on_sync_response(&mut self, resp: SyncResponse, store: &ChainStore, config: &ExodusConfig) {
-        for block in resp.blocks {
-            self.on_commit(CommitMessage { checkpoint: block }, store, config);
+        if resp.blocks.iter().any(|b| b.height() == 0) {
+            // A full-chain response (starts at genesis): candidate for a fork
+            // reorg.  reconcile_chain adopts it only when it is longer than the
+            // local chain.
+            self.reconcile_chain(resp.blocks, store, config);
+        } else {
+            // Suffix-only response: normal staggered catch-up.
+            for block in resp.blocks {
+                self.on_commit(CommitMessage { checkpoint: block }, store, config);
+            }
         }
+    }
+
+    /// Decide whether the peer's chain should replace the local one and, if so,
+    /// roll back to the common ancestor and re-apply the peer's blocks.  This is
+    /// the reorg path that lets a node adopt the canonical branch after a fork
+    /// instead of rejecting every commit with a bad prev-hash.
+    fn reconcile_chain(&mut self, peer: Vec<Checkpoint>, store: &ChainStore, config: &ExodusConfig) {
+        let mut blocks = peer;
+        blocks.sort_by_key(|b| b.height());
+        let Some(tip) = blocks.last() else {
+            return;
+        };
+        // Only adopt a strictly longer chain; equal-length forks keep the local
+        // branch (deterministic tie-break) to avoid oscillation.
+        if tip.height() <= store.height() {
+            return;
+        }
+        let local_height = store.height();
+        let ancestor = common_ancestor(store, &blocks);
+        if ancestor < local_height {
+            if let Err(e) = store.rollback(ancestor) {
+                eprintln!("reorg rollback failed: {e}");
+                return;
+            }
+            eprintln!(
+                "fork reorg: rolled back {} block(s) to height {ancestor}",
+                local_height - ancestor
+            );
+            // Blocks above the ancestor are being replaced.
+            self.pending_commits.retain(|&h, _| h <= store.height());
+        }
+        for block in blocks.iter().filter(|b| b.height() > ancestor) {
+            if block.height() != store.height() + 1 {
+                eprintln!("reorg gap at height {}", block.height());
+                return;
+            }
+            let mut seen_here = HashSet::new();
+            if let Err(e) = validate_checkpoint(
+                block,
+                store,
+                config.flops_tolerance,
+                quorum_size(self, store, config),
+                false,
+                Some(&mut seen_here),
+            ) {
+                eprintln!("reorg rejecting block {}: {e}", block.height());
+                return;
+            }
+            self.commit_local(block, store);
+        }
+        // The committed set may have changed (old claims rolled back, new ones
+        // adopted); rebuild it from the store to stay consistent.
+        self.committed_claim_ids = store.all_committed_claim_ids();
     }
 
     fn propose_internal(&mut self, store: &ChainStore, config: &ExodusConfig) {
@@ -782,4 +882,170 @@ impl ProtocolState {
 
 fn now() -> f64 {
     monotonic_now()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::config_from_env;
+    use crate::models::{make_claim, DeviceTier, Precision};
+
+    fn temp_store() -> ChainStore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "exodus-protocol-test-{}-{n}",
+            std::process::id()
+        ));
+        let store = ChainStore::open(&path).unwrap();
+        store.append(&models::genesis_checkpoint()).unwrap();
+        store
+    }
+
+    fn signed_claim(seq: i64) -> SignedContribution {
+        let (private_key, _) = crate::crypto::generate_key_pair();
+        let public_key = crate::crypto::public_key_from_private(&private_key);
+        let node_id = crate::crypto::node_id_from_public_key(&public_key);
+        let claim = make_claim(
+            format!("reorg-claim-{seq}"),
+            node_id,
+            seq,
+            "llama-3b.gguf",
+            3.0,
+            Precision::Int4,
+            512,
+            128,
+            12.5,
+            1.9e12,
+            DeviceTier::GpuNvidia,
+            "2026-08-05T00:00:00+00:00".to_string(),
+            "2026-08-05T00:00:12+00:00".to_string(),
+            0,
+            String::new(),
+        );
+        SignedContribution::create(claim, &private_key)
+    }
+
+    fn quorum_sig(private_key: &[u8], proposal: &CheckpointProposal) -> QuorumSignature {
+        let public_key = crate::crypto::public_key_from_private(private_key);
+        QuorumSignature {
+            node_id: crate::crypto::node_id_from_public_key(&public_key),
+            public_key_hex: crate::crypto::hex(&public_key),
+            signature_hex: crate::crypto::hex(&crate::crypto::sign(
+                proposal.proposal_hash().as_bytes(),
+                private_key,
+            )),
+        }
+    }
+
+    fn sealed_block(
+        private_key: &[u8],
+        height: i64,
+        epoch: i64,
+        prev_hash: String,
+        claims: Vec<SignedContribution>,
+    ) -> Checkpoint {
+        let public_key = crate::crypto::public_key_from_private(private_key);
+        let proposal = CheckpointProposal {
+            epoch,
+            height,
+            prev_hash,
+            sealed_by: crate::crypto::node_id_from_public_key(&public_key),
+            claims,
+            created_at: utcnow_iso(),
+        };
+        Checkpoint {
+            proposal: proposal.clone(),
+            signatures: vec![quorum_sig(private_key, &proposal)],
+        }
+    }
+
+    fn test_state(store: &ChainStore) -> ProtocolState {
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        ProtocolState {
+            node_id: crate::crypto::node_id_from_public_key(&public_key),
+            private_key: private_key.to_vec(),
+            public_key_hex: crate::crypto::hex(&public_key),
+            pending: HashMap::new(),
+            committed_claim_ids: store.all_committed_claim_ids(),
+            proposed_claim_ids: HashSet::new(),
+            proposals: HashMap::new(),
+            signatures: HashMap::new(),
+            signed: HashSet::new(),
+            view: 1,
+            last_activity: monotonic_now(),
+            peers: HashMap::new(),
+            pending_commits: BTreeMap::new(),
+            recent_fork_alerts: HashSet::new(),
+            outgoing: Vec::new(),
+            listener_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconcile_chain_rolls_back_to_longest_peer_branch() {
+        let store = temp_store();
+        let genesis = store.head().unwrap();
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        let node_id = crate::crypto::node_id_from_public_key(&public_key);
+        let mut state = test_state(&store);
+        state.node_id = node_id.clone();
+        state.private_key = private_key.to_vec();
+        state.public_key_hex = crate::crypto::hex(&public_key);
+
+        // Local branch: node commits a sibling block at height 1.
+        let claim_a = signed_claim(1);
+        let block_a = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim_a.clone()]);
+        store.append(&block_a).unwrap();
+        assert_eq!(store.height(), 1);
+        assert_eq!(store.head().unwrap().block_hash(), block_a.block_hash());
+
+        // Peer branch: a *longer* chain that diverges at the same height 1,
+        // built from a different sibling block plus a height-2 extension.
+        let claim_b = signed_claim(2);
+        let block_b = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim_b.clone()]);
+        let claim_c = signed_claim(3);
+        let block_c = sealed_block(&private_key, 2, 2, block_b.block_hash(), vec![claim_c.clone()]);
+        assert_ne!(block_a.block_hash(), block_b.block_hash());
+
+        let peer = vec![genesis.clone(), block_b.clone(), block_c.clone()];
+        state.reconcile_chain(peer, &store, &config_from_env());
+
+        // The fork must be rolled back and the longer branch adopted.
+        assert_eq!(store.height(), 2);
+        assert_eq!(store.head().unwrap().block_hash(), block_c.block_hash());
+        assert_ne!(store.get_block(1).unwrap().block_hash(), block_a.block_hash());
+        assert_eq!(store.get_block(1).unwrap().block_hash(), block_b.block_hash());
+
+        // Committed set follows the adopted branch.
+        let committed = store.all_committed_claim_ids();
+        assert!(committed.contains(&claim_b.claim.claim_id));
+        assert!(committed.contains(&claim_c.claim.claim_id));
+        assert!(!committed.contains(&claim_a.claim.claim_id));
+        assert_eq!(state.committed_claim_ids, committed);
+    }
+
+    #[test]
+    fn reconcile_chain_keeps_local_branch_when_not_longer() {
+        let store = temp_store();
+        let genesis = store.head().unwrap();
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        let mut state = test_state(&store);
+        state.node_id = crate::crypto::node_id_from_public_key(&public_key);
+        state.private_key = private_key.to_vec();
+
+        let claim_a = signed_claim(10);
+        let block_a = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim_a.clone()]);
+        store.append(&block_a).unwrap();
+
+        // Peer chain is equal-length but different -> must NOT be adopted.
+        let claim_b = signed_claim(11);
+        let block_b = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim_b.clone()]);
+        let peer = vec![genesis, block_b.clone()];
+        state.reconcile_chain(peer, &store, &config_from_env());
+
+        assert_eq!(store.height(), 1);
+        assert_eq!(store.head().unwrap().block_hash(), block_a.block_hash());
+    }
 }

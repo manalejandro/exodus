@@ -3,6 +3,7 @@
 //! Ported from `exodus/ledger/store.py`.  Only appends are allowed; chain
 //! integrity is enforced on append and re-checked by [`ChainStore::verify_chain`].
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -204,6 +205,43 @@ impl ChainStore {
         }
         tx.commit().map_err(|e| LedgerError(e.to_string()))?;
         Ok(())
+    }
+
+    /// Roll the chain back to `keep_height`, deleting every block above that
+    /// height together with its claims, so a divergent branch can be replaced
+    /// during a fork reorg.  `-1` empties the ledger.  Returns the surviving
+    /// head after the rollback, or `None` when nothing remains.
+    pub fn rollback(&self, keep_height: i64) -> Result<Option<Checkpoint>, LedgerError> {
+        {
+            let conn = self.conn.lock().unwrap();
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| LedgerError(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM claims WHERE height > ?1",
+                params![keep_height],
+            )
+            .map_err(|e| LedgerError(e.to_string()))?;
+            tx.execute(
+                "DELETE FROM blocks WHERE height > ?1",
+                params![keep_height],
+            )
+            .map_err(|e| LedgerError(e.to_string()))?;
+            tx.commit().map_err(|e| LedgerError(e.to_string()))?;
+        }
+        if keep_height < 0 {
+            return Ok(None);
+        }
+        Ok(self.get_block(keep_height))
+    }
+
+    /// All `claim_id`s currently stored in the ledger.  The consensus layer
+    /// uses this to rebuild its in-memory committed set after a fork reorg.
+    pub fn all_committed_claim_ids(&self) -> HashSet<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT claim_id FROM claims").unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.filter_map(Result::ok).collect()
     }
 
     // -- reads ---------------------------------------------------------------
@@ -484,6 +522,35 @@ mod tests {
         // …but the store recognises it as already committed, which is what lets
         // the consensus layer reconcile instead of spinning on SyncRequests.
         assert!(store.is_already_committed(&twin));
+    }
+
+    #[test]
+    fn rollback_removes_blocks_and_claims() {
+        let store = temp_store();
+        let head = store.head().unwrap();
+        let c1 = signed_claim("exdnode3", 1);
+        let b1 = checkpoint_with(&head, 1, 1, vec![c1.clone()]);
+        store.append(&b1).unwrap();
+        let b1_hash = store.head().unwrap().block_hash();
+
+        let c2 = signed_claim("exdnode4", 2);
+        let b2 = checkpoint_with(&store.head().unwrap(), 2, 2, vec![c2.clone()]);
+        store.append(&b2).unwrap();
+        assert_eq!(store.height(), 2);
+        assert!(store.all_committed_claim_ids().contains(&c2.claim.claim_id));
+
+        // Reorging back to height 1 must drop block 2 and its claim…
+        store.rollback(1).unwrap();
+        assert_eq!(store.height(), 1);
+        assert_eq!(store.head().unwrap().block_hash(), b1_hash);
+        assert!(!store.all_committed_claim_ids().contains(&c2.claim.claim_id));
+        assert!(store.all_committed_claim_ids().contains(&c1.claim.claim_id));
+
+        // …and the ledger is still appendable from the new head.
+        let c3 = signed_claim("exdnode5", 3);
+        let b3 = checkpoint_with(&store.head().unwrap(), 2, 3, vec![c3.clone()]);
+        assert!(store.append(&b3).is_ok());
+        assert_eq!(store.height(), 2);
     }
 
     #[test]
