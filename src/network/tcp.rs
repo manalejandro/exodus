@@ -27,6 +27,7 @@ struct Inner {
     handlers: Mutex<HashMap<String, Vec<(usize, Arc<Handler>)>>>,
     next_id: AtomicUsize,
     peers: Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    active_connects: Mutex<HashMap<String, ()>>,
     seen: Mutex<(HashMap<String, ()>, VecDeque<String>)>,
     runtime: Mutex<Option<Handle>>,
     stopping: AtomicBool,
@@ -36,7 +37,7 @@ impl Inner {
     fn make_frame(&self, topic: &str, payload: &Value) -> Value {
         json!({
             "t": topic,
-            "p": payload.to_string(),
+            "p": payload.clone(),
             "f": self.node_id,
             "i": uuid::Uuid::new_v4().simple().to_string(),
         })
@@ -93,11 +94,7 @@ impl Inner {
         let Some(topic) = frame.get("t").and_then(|v| v.as_str()).map(str::to_string) else {
             return true;
         };
-        let payload = frame
-            .get("p")
-            .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_str::<Value>(s).ok())
-            .unwrap_or(Value::Null);
+        let payload = frame.get("p").cloned().unwrap_or(Value::Null);
         self.deliver(&topic, &payload);
         let senders = {
             let peers = self.peers.lock().unwrap();
@@ -167,6 +164,7 @@ impl TcpTransport {
                 handlers: Mutex::new(HashMap::new()),
                 next_id: AtomicUsize::new(0),
                 peers: Mutex::new(HashMap::new()),
+                active_connects: Mutex::new(HashMap::new()),
                 seen: Mutex::new((HashMap::new(), VecDeque::new())),
                 runtime: Mutex::new(None),
                 stopping: AtomicBool::new(false),
@@ -418,10 +416,25 @@ fn discovery_loop(inner: Arc<Inner>, group: String, port: u16) {
                     .unwrap_or(&src.ip().to_string())
                     .to_string();
                 let p = v.get("port").and_then(|x| x.as_u64()).unwrap_or(52514);
+                let addr = format!("{host}:{p}");
+                // Only keep one connection loop per address: discovery announces
+                // arrive every ~2.5s from each node, and each would otherwise
+                // spawn another long-lived reconnecting task for the same peer.
+                if inner.peers.lock().unwrap().contains_key(&addr) {
+                    continue;
+                }
+                let mut active = inner.active_connects.lock().unwrap();
+                if active.contains_key(&addr) {
+                    continue;
+                }
+                active.insert(addr.clone(), ());
+                drop(active);
                 if let Some(runtime) = inner.runtime.lock().unwrap().as_ref() {
                     let value = inner.clone();
+                    let key = addr.clone();
                     let _ = runtime.spawn(async move {
-                        connect_loop(value, format!("{host}:{p}")).await
+                        connect_loop(value.clone(), key.clone()).await;
+                        value.active_connects.lock().unwrap().remove(&key);
                     });
                 }
             }

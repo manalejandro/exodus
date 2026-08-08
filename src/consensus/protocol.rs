@@ -47,6 +47,7 @@ struct ProtocolState {
     pending_commits: BTreeMap<i64, Checkpoint>,
     recent_fork_alerts: HashSet<String>,
     recent_commit_rejects: VecDeque<String>,
+    last_sync_request: f64,
 
     outgoing: Vec<(String, Message)>,
     listener_calls: Vec<(i64, String)>,
@@ -57,6 +58,12 @@ struct ProtocolState {
 /// never advance locally; without this ring the same rejection would be logged
 /// (and re-validated) on every redelivery, forever.
 const MAX_RECENT_COMMIT_REJECTS: usize = 512;
+
+/// Minimum gap between outgoing sync requests.  A node that cannot advance
+/// (e.g. peers keep offering blocks that fail local validation) would otherwise
+/// re-request a multi-MB full-chain response on every heartbeat/redelivery,
+/// pinning the link at several MB/s.
+const MIN_SYNC_INTERVAL_SECONDS: f64 = 5.0;
 
 pub struct ConsensusProtocol {
     pub node_id: String,
@@ -179,6 +186,7 @@ impl ConsensusProtocol {
                 pending_commits: BTreeMap::new(),
                 recent_fork_alerts: HashSet::new(),
                 recent_commit_rejects: VecDeque::new(),
+                last_sync_request: 0.0,
                 outgoing: Vec::new(),
                 listener_calls: Vec::new(),
             }),
@@ -566,13 +574,7 @@ impl ProtocolState {
                 return;
             }
             eprintln!("local append rejected: {e}");
-            self.outgoing.push((
-                topics::SYNC.to_string(),
-                Message::SyncRequest(SyncRequest {
-                    node_id: self.node_id.clone(),
-                    from_height: checkpoint.height() - 1,
-                }),
-            ));
+            self.request_sync(checkpoint.height() - 1);
             return;
         }
         for signed in &checkpoint.proposal.claims {
@@ -617,24 +619,12 @@ impl ProtocolState {
         let head_height = head.as_ref().map(|h| h.height()).unwrap_or(-1);
         if head.is_none() && checkpoint.height() != 0 {
             self.pending_commits.insert(checkpoint.height(), checkpoint);
-            self.outgoing.push((
-                topics::SYNC.to_string(),
-                Message::SyncRequest(SyncRequest {
-                    node_id: self.node_id.clone(),
-                    from_height: -1,
-                }),
-            ));
+            self.request_sync(-1);
             return;
         }
         if checkpoint.height() > head_height + 1 {
             self.pending_commits.insert(checkpoint.height(), checkpoint);
-            self.outgoing.push((
-                topics::SYNC.to_string(),
-                Message::SyncRequest(SyncRequest {
-                    node_id: self.node_id.clone(),
-                    from_height: head_height,
-                }),
-            ));
+            self.request_sync(head_height);
             return;
         }
         // A block exactly one past our head that is built on a *different*
@@ -647,13 +637,7 @@ impl ProtocolState {
             {
                 let key = format!("{}{}", h.block_hash(), checkpoint.proposal.prev_hash);
                 if self.recent_fork_alerts.insert(key) {
-                    self.outgoing.push((
-                        topics::SYNC.to_string(),
-                        Message::SyncRequest(SyncRequest {
-                            node_id: self.node_id.clone(),
-                            from_height: -1,
-                        }),
-                    ));
+                    self.request_sync(-1);
                 }
                 return;
             }
@@ -697,6 +681,24 @@ impl ProtocolState {
         }
     }
 
+    /// Queue a `SyncRequest` subject to a rate limit so a node that cannot make
+    /// progress (or a peer redelivering the same block) cannot trigger an
+    /// endless stream of full-chain responses.
+    fn request_sync(&mut self, from_height: i64) {
+        let t = now();
+        if t - self.last_sync_request < MIN_SYNC_INTERVAL_SECONDS {
+            return;
+        }
+        self.last_sync_request = t;
+        self.outgoing.push((
+            topics::SYNC.to_string(),
+            Message::SyncRequest(SyncRequest {
+                node_id: self.node_id.clone(),
+                from_height,
+            }),
+        ));
+    }
+
     fn flush_pending_commits(&mut self, store: &ChainStore, config: &ExodusConfig) {
         let head = store.head();
         if head.is_none() {
@@ -731,23 +733,11 @@ impl ProtocolState {
         self.peers.insert(hb.node_id.clone(), hb.clone());
         let head = store.head();
         let Some(head) = head else {
-            self.outgoing.push((
-                topics::SYNC.to_string(),
-                Message::SyncRequest(SyncRequest {
-                    node_id: self.node_id.clone(),
-                    from_height: -1,
-                }),
-            ));
+            self.request_sync(-1);
             return;
         };
         if hb.height > head.height() {
-            self.outgoing.push((
-                topics::SYNC.to_string(),
-                Message::SyncRequest(SyncRequest {
-                    node_id: self.node_id.clone(),
-                    from_height: head.height(),
-                }),
-            ));
+            self.request_sync(head.height());
             return;
         }
         if hb.height == head.height() && hb.block_hash != head.block_hash() {
@@ -1009,6 +999,7 @@ mod tests {
             pending_commits: BTreeMap::new(),
             recent_fork_alerts: HashSet::new(),
             recent_commit_rejects: VecDeque::new(),
+            last_sync_request: 0.0,
             outgoing: Vec::new(),
             listener_calls: Vec::new(),
         }
@@ -1132,5 +1123,26 @@ mod tests {
         // A different, validly-quorummed block must still commit normally.
         assert_eq!(store.height(), 1);
         assert!(state.recent_commit_rejects.is_empty());
+    }
+
+    #[test]
+    fn sync_requests_are_rate_limited() {
+        let store = temp_store();
+        let mut state = test_state(&store);
+        state.last_sync_request = 0.0;
+
+        // First request goes out…
+        state.request_sync(0);
+        assert_eq!(state.outgoing.len(), 1);
+        let first = &state.outgoing[0].1;
+        let Message::SyncRequest(req) = first else {
+            panic!("expected SyncRequest, got {first:?}");
+        };
+        assert_eq!(req.from_height, 0);
+
+        // …but an immediate retry (e.g. another peer redelivering the same
+        // block while we cannot advance) is dropped by the cooldown.
+        state.request_sync(1);
+        assert_eq!(state.outgoing.len(), 1);
     }
 }
