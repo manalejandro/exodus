@@ -419,6 +419,7 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
     let mut peers_asked = 0usize;
     let mut peers_responded = 0usize;
     let mut peer_replies: Vec<(String, String)> = Vec::new();
+    let mut peer_errors: Vec<(String, String)> = Vec::new();
     if c.config.distributed_inference {
         let request_id = uuid::Uuid::new_v4().to_string();
         let messages: Vec<crate::models::InferenceTurn> = turns
@@ -464,7 +465,9 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
                     continue;
                 }
                 peers_responded += 1;
-                if response.error.is_none() {
+                if let Some(err) = response.error {
+                    peer_errors.push((response.node_id, err));
+                } else {
                     peer_replies.push((response.node_id, response.reply));
                 }
                 if expected > 0 && seen.len() >= expected {
@@ -499,6 +502,10 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
             "responses": peer_replies
                 .iter()
                 .map(|(node_id, reply)| json!({ "node_id": node_id, "reply": reply }))
+                .collect::<Vec<_>>(),
+            "peer_errors": peer_errors
+                .iter()
+                .map(|(node_id, err)| json!({ "node_id": node_id, "error": err }))
                 .collect::<Vec<_>>(),
         },
     })
