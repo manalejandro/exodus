@@ -19,6 +19,17 @@ pub struct ExodusConfig {
     pub distributed_inference: bool,
     pub distributed_timeout_seconds: f64,
 
+    /// `server` runs a long-lived `llama-server` (OpenAI-compatible HTTP,
+    /// applies the model chat template, `--parallel N` for concurrent slots);
+    /// `cli` shells out to `llama-bin` per turn.  Recent llama-cli builds are
+    /// an interactive chat client that ignores `-p` and hangs when piped, so
+    /// `server` is the default.
+    pub inference_backend: String,
+    pub llama_server_bin: String,
+    pub llama_server_host: String,
+    pub llama_server_port: u16,
+    pub llama_server_parallel: usize,
+
     pub epoch_seconds: f64,
     pub election_timeout_seconds: f64,
     pub byzantine: bool,
@@ -109,6 +120,7 @@ pub fn config_from_env() -> ExodusConfig {
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_data_dir());
     let model_dir = env::var("EXODUS_MODEL_DIR").ok().filter(|s| !s.trim().is_empty());
+    let max_concurrent = env_int("MAX_CONCURRENT_INFERENCE", 1) as usize;
 
     ExodusConfig {
         data_dir,
@@ -119,9 +131,15 @@ pub fn config_from_env() -> ExodusConfig {
         inference: env_bool("INFERENCE", true),
         max_tokens: env_int("MAX_TOKENS", 256),
         inference_timeout_seconds: env_float("INFERENCE_TIMEOUT_SECONDS", 300.0),
-        max_concurrent_inference: env_int("MAX_CONCURRENT_INFERENCE", 1) as usize,
+        max_concurrent_inference: max_concurrent,
         distributed_inference: env_bool("DISTRIBUTED_INFERENCE", true),
         distributed_timeout_seconds: env_float("DISTRIBUTED_TIMEOUT_SECONDS", 60.0),
+        inference_backend: env_str("INFERENCE_BACKEND", "server"),
+        llama_server_bin: env_str("LLAMA_SERVER_BIN", "llama-server"),
+        llama_server_host: env_str("LLAMA_SERVER_HOST", "127.0.0.1"),
+        llama_server_port: env_int("LLAMA_SERVER_PORT", 52516) as u16,
+        llama_server_parallel: env_int("LLAMA_SERVER_PARALLEL", max_concurrent as i64)
+            .max(1) as usize,
         epoch_seconds: env_float("EPOCH_SECONDS", 30.0),
         election_timeout_seconds: env_float("ELECTION_TIMEOUT_SECONDS", 90.0),
         byzantine: env_bool("BYZANTINE", true),

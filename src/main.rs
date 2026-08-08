@@ -188,9 +188,12 @@ fn main() {
                 })
                 .unwrap_or_default();
             println!(
-                "inference : EXODUS_INFERENCE={} llama_bin={} model_dir={} models=[{}]",
+                "inference : EXODUS_INFERENCE={} backend={} llama_bin={} llama_server={}:{} model_dir={} models=[{}]",
                 cfg.inference,
+                cfg.inference_backend,
                 cfg.llama_bin,
+                cfg.llama_server_host,
+                cfg.llama_server_port,
                 model_dir.display(),
                 models.join(", "),
             );

@@ -10,6 +10,7 @@ pub mod gpu;
 pub mod identity;
 pub mod inference;
 pub mod ledger;
+pub mod llama_server;
 pub mod models;
 pub mod network;
 pub mod rewards;

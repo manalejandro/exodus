@@ -187,14 +187,14 @@ pub fn complete(
 
 /// Trim surrounding whitespace and a leading `Assistant:` continuation marker
 /// that some runtimes echo back.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     let out = text.trim();
     let out = out.strip_prefix("Assistant:").map(str::trim).unwrap_or(out);
     out.to_string()
 }
 
 /// Whether the runtime binary exists (absolute path or on `PATH`).
-fn binary_exists(bin: &str) -> bool {
+pub(crate) fn binary_exists(bin: &str) -> bool {
     if bin.contains('/') || bin.contains('\\') {
         return Path::new(bin).is_file();
     }

@@ -458,10 +458,10 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
     let config = c.config.clone();
     let path = model_path.clone();
     let turns_for_task = turns.to_vec();
-    let gpu_for_task = gpu.clone();
+    let c_for_task = c.clone();
     let local_started = std::time::Instant::now();
     let local_task = tokio::task::spawn_blocking(move || {
-        crate::inference::complete(&config, &gpu_for_task, &path, &turns_for_task)
+        c_for_task.complete_local(&path, &turns_for_task, config.max_tokens)
     });
 
     // 2. Distributed fan-out: every peer runs the same prompt and replies on
@@ -910,6 +910,7 @@ mod tests {
         let mut cfg = crate::config::config_from_env();
         cfg.inference = true;
         cfg.max_tokens = 32;
+        cfg.inference_backend = "cli".into();
         cfg.llama_bin = llama.to_string_lossy().into_owned();
         cfg.model_dir = Some(models);
         cfg.distributed_timeout_seconds = 5.0;

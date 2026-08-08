@@ -2,6 +2,7 @@
 //! consensus, rewards and the transport for a single node.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,6 +51,8 @@ pub struct ExodusCoordinator {
     cpu_sampler: crate::system::CpuSampler,
     /// Most recent telemetry announced by each peer (node_id → stats).
     peer_stats: Mutex<HashMap<String, (NodeStats, Instant)>>,
+    /// Long-lived llama-server backend serving this node's completions.
+    llama: Arc<crate::llama_server::LlamaServer>,
 }
 
 /// Decode a raw JSON payload into a typed protocol message for a topic.
@@ -121,6 +124,18 @@ impl ExodusCoordinator {
             Some(listener),
         );
         let infer_slots = tokio::sync::Semaphore::new(config.max_concurrent_inference.max(1));
+        let gpu = crate::gpu::detect(config.gpu_layers);
+        let layers = config
+            .gpu_layers
+            .unwrap_or(if gpu.available { 99 } else { 0 });
+        let llama = crate::llama_server::LlamaServer::new(
+            config.llama_server_bin.clone(),
+            config.llama_server_host.clone(),
+            config.llama_server_port,
+            config.llama_server_parallel,
+            layers,
+            Duration::from_secs_f64(config.inference_timeout_seconds.max(1.0)),
+        );
         Arc::new(ExodusCoordinator {
             identity,
             store,
@@ -136,6 +151,7 @@ impl ExodusCoordinator {
             infer_slots,
             cpu_sampler: crate::system::CpuSampler::new(),
             peer_stats: Mutex::new(HashMap::new()),
+            llama,
         })
     }
 
@@ -575,7 +591,28 @@ impl ExodusCoordinator {
             .collect();
         let mut cfg = self.config.clone();
         cfg.max_tokens = request.max_tokens.clamp(1, cfg.max_tokens);
-        crate::inference::complete(&cfg, &self.gpu_info(), &path, &turns)
+        self.complete_local(&path, &turns, cfg.max_tokens)
+    }
+
+    /// Run one completion against the local runtime.  With the default
+    /// `server` backend this goes through the long-lived llama-server HTTP API
+    /// (applies the model chat template, `--parallel N`); `cli` falls back to
+    /// per-turn llama-cli one-shot runs for environments that still ship the
+    /// legacy binary.
+    pub fn complete_local(
+        &self,
+        model_path: &Path,
+        turns: &[ChatTurn],
+        max_tokens: i64,
+    ) -> Result<String, String> {
+        let max_tokens = max_tokens.clamp(1, self.config.max_tokens);
+        if self.config.inference_backend == "server" {
+            self.llama.chat(model_path, turns, max_tokens)
+        } else {
+            let mut cfg = self.config.clone();
+            cfg.max_tokens = max_tokens;
+            crate::inference::complete(&cfg, &self.gpu_info(), model_path, turns)
+        }
     }
 
     /// Record a completed inference as a contribution claim, best-effort: the
