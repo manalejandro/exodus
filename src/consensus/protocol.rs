@@ -48,6 +48,7 @@ struct ProtocolState {
     recent_fork_alerts: HashSet<String>,
     recent_commit_rejects: VecDeque<String>,
     last_sync_request: f64,
+    sync_interval_seconds: f64,
 
     outgoing: Vec<(String, Message)>,
     listener_calls: Vec<(i64, String)>,
@@ -58,12 +59,6 @@ struct ProtocolState {
 /// never advance locally; without this ring the same rejection would be logged
 /// (and re-validated) on every redelivery, forever.
 const MAX_RECENT_COMMIT_REJECTS: usize = 512;
-
-/// Minimum gap between outgoing sync requests.  A node that cannot advance
-/// (e.g. peers keep offering blocks that fail local validation) would otherwise
-/// re-request a multi-MB full-chain response on every heartbeat/redelivery,
-/// pinning the link at several MB/s.
-const MIN_SYNC_INTERVAL_SECONDS: f64 = 5.0;
 
 pub struct ConsensusProtocol {
     pub node_id: String,
@@ -163,6 +158,7 @@ impl ConsensusProtocol {
         config: ExodusConfig,
         commit_listener: Option<Arc<CommitListener>>,
     ) -> Arc<ConsensusProtocol> {
+        let sync_interval = config.sync_request_interval_seconds;
         let proc = Arc::new(ConsensusProtocol {
             node_id: node_id.clone(),
             store,
@@ -187,6 +183,7 @@ impl ConsensusProtocol {
                 recent_fork_alerts: HashSet::new(),
                 recent_commit_rejects: VecDeque::new(),
                 last_sync_request: 0.0,
+                sync_interval_seconds: sync_interval,
                 outgoing: Vec::new(),
                 listener_calls: Vec::new(),
             }),
@@ -600,9 +597,18 @@ impl ProtocolState {
     fn on_commit(&mut self, cm: CommitMessage, store: &ChainStore, config: &ExodusConfig) {
         let checkpoint = cm.checkpoint;
         let head = store.head();
+        eprintln!(
+            "[on_commit] node={} h={} prev={} head={:?} head_h={}",
+            self.node_id,
+            checkpoint.height(),
+            checkpoint.proposal.prev_hash,
+            head.as_ref().map(|x| x.block_hash()),
+            store.height()
+        );
         if let Some(h) = &head {
             if checkpoint.height() <= h.height() {
                 if h.block_hash() != checkpoint.block_hash() && checkpoint.height() == h.height() {
+                    eprintln!("[on_commit] same-height fork, ForkAlert only");
                     self.outgoing.push((
                         topics::FORKS.to_string(),
                         Message::ForkAlert(ForkAlert {
@@ -612,6 +618,12 @@ impl ProtocolState {
                             observed_hash_b: checkpoint.block_hash(),
                         }),
                     ));
+                    // Equal-length fork: adopt the peer branch when it wins the
+                    // deterministic tie-break (smaller head hash) so both nodes
+                    // end on the same block instead of staying permanently split.
+                    if checkpoint.block_hash() < h.block_hash() {
+                        self.request_sync(-1);
+                    }
                 }
                 return;
             }
@@ -629,16 +641,17 @@ impl ProtocolState {
         }
         // A block exactly one past our head that is built on a *different*
         // parent is a fork where the peer is ahead of us (its chain is longer).
-        // Fetch the peer's full chain once so reconcile_chain can roll us back
+        // Fetch the peer's full chain so reconcile_chain can roll us back
         // to the common ancestor and adopt it, instead of rejecting forever.
+        // We intentionally rely on request_sync's rate limiter rather than a
+        // dedup set here: recent_fork_alerts is also written by same-height
+        // ForkAlert handling, so sharing it would poison this key and suppress
+        // the healing request forever.
         if let Some(h) = head.as_ref() {
             if checkpoint.height() == h.height() + 1
                 && checkpoint.proposal.prev_hash != h.block_hash()
             {
-                let key = format!("{}{}", h.block_hash(), checkpoint.proposal.prev_hash);
-                if self.recent_fork_alerts.insert(key) {
-                    self.request_sync(-1);
-                }
+                self.request_sync(-1);
                 return;
             }
         }
@@ -655,7 +668,10 @@ impl ProtocolState {
             Some(&mut seen),
         ) {
             self.note_commit_reject(&checkpoint.block_hash());
-            eprintln!("rejecting commit: {e}");
+            eprintln!("rejecting commit: {e} (quorum={}, sigs={}, committee={:?})",
+                quorum_size(self, store, config),
+                checkpoint.signatures.len(),
+                committee_members(self, store, config));
             return;
         }
         self.committed_claim_ids = seen;
@@ -685,8 +701,9 @@ impl ProtocolState {
     /// progress (or a peer redelivering the same block) cannot trigger an
     /// endless stream of full-chain responses.
     fn request_sync(&mut self, from_height: i64) {
+        eprintln!("[request_sync] from={from_height} node={}", self.node_id);
         let t = now();
-        if t - self.last_sync_request < MIN_SYNC_INTERVAL_SECONDS {
+        if t - self.last_sync_request < self.sync_interval_seconds {
             return;
         }
         self.last_sync_request = t;
@@ -783,6 +800,7 @@ impl ProtocolState {
     }
 
     fn on_sync_response(&mut self, resp: SyncResponse, store: &ChainStore, config: &ExodusConfig) {
+        eprintln!("[on_sync_response] {} blocks", resp.blocks.len());
         if resp.blocks.iter().any(|b| b.height() == 0) {
             // A full-chain response (starts at genesis): candidate for a fork
             // reorg.  reconcile_chain adopts it only when it is longer than the
@@ -806,10 +824,26 @@ impl ProtocolState {
         let Some(tip) = blocks.last() else {
             return;
         };
-        // Only adopt a strictly longer chain; equal-length forks keep the local
-        // branch (deterministic tie-break) to avoid oscillation.
-        if tip.height() <= store.height() {
+        eprintln!(
+            "[reconcile] local height {} peer tip {} ({} blocks)",
+            store.height(),
+            tip.height(),
+            blocks.len()
+        );
+        // Only adopt a strictly longer chain, or an equal-length chain that wins the
+        // deterministic tie-break (lexicographically smaller head hash), so all
+        // nodes converge on one branch at every height instead of oscillating.
+        if tip.height() < store.height() {
+            eprintln!("[reconcile] declining: peer not longer");
             return;
+        }
+        if tip.height() == store.height() {
+            if let Some(local) = store.head() {
+                if tip.block_hash() >= local.block_hash() {
+                    eprintln!("[reconcile] declining: equal-length tie lost");
+                    return;
+                }
+            }
         }
         let local_height = store.height();
         let ancestor = common_ancestor(store, &blocks);
@@ -856,6 +890,13 @@ impl ProtocolState {
         let Some(head) = store.head() else {
             return;
         };
+        // Never emit a sibling proposal at a height we already have an
+        // outstanding (unsigned or still-propagating) proposal for: a second,
+        // differently-encoded block at the same height splits the network and
+        // lets honest peers half-commit two versions of one height.
+        if self.proposals.values().any(|p| p.height == head.height() + 1) {
+            return;
+        }
         let mut claims: Vec<SignedContribution> = self
             .pending
             .iter()
@@ -1000,6 +1041,7 @@ mod tests {
             recent_fork_alerts: HashSet::new(),
             recent_commit_rejects: VecDeque::new(),
             last_sync_request: 0.0,
+            sync_interval_seconds: 5.0,
             outgoing: Vec::new(),
             listener_calls: Vec::new(),
         }
@@ -1061,14 +1103,57 @@ mod tests {
         let block_a = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim_a.clone()]);
         store.append(&block_a).unwrap();
 
-        // Peer chain is equal-length but different -> must NOT be adopted.
-        let claim_b = signed_claim(11);
-        let block_b = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim_b.clone()]);
+        // Peer chain is equal-length but different.  The equal-length tie-break
+        // is deterministic (smaller head hash wins), so craft a peer tip that
+        // LOSES the tie-break and must therefore NOT be adopted.
+        let mut seq = 12i64;
+        let mut block_b = sealed_block(
+            &private_key,
+            1,
+            1,
+            genesis.block_hash(),
+            vec![signed_claim(11)],
+        );
+        while block_b.block_hash() < block_a.block_hash() && seq < 1000 {
+            block_b = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![signed_claim(seq)]);
+            seq += 1;
+        }
+        assert!(block_b.block_hash() >= block_a.block_hash());
         let peer = vec![genesis, block_b.clone()];
         state.reconcile_chain(peer, &store, &config_from_env());
 
         assert_eq!(store.height(), 1);
         assert_eq!(store.head().unwrap().block_hash(), block_a.block_hash());
+    }
+
+    #[test]
+    fn reconcile_chain_adopts_equal_length_winning_tie_break() {
+        let store = temp_store();
+        let genesis = store.head().unwrap();
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        let mut state = test_state(&store);
+        state.node_id = crate::crypto::node_id_from_public_key(&public_key);
+        state.private_key = private_key.to_vec();
+
+        let claim_a = signed_claim(20);
+        let block_a = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim_a.clone()]);
+        store.append(&block_a).unwrap();
+
+        // Peer is equal-length but its head hash is smaller, so the tie-break
+        // must adopt it: both nodes converge on the canonical branch.
+        let mut seq = 21i64;
+        let mut block_b = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![signed_claim(seq)]);
+        while block_b.block_hash() >= block_a.block_hash() && seq < 1000 {
+            seq += 1;
+            block_b = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![signed_claim(seq)]);
+        }
+        assert!(block_b.block_hash() < block_a.block_hash());
+
+        let peer = vec![genesis.clone(), block_b.clone()];
+        state.reconcile_chain(peer, &store, &config_from_env());
+
+        assert_eq!(store.height(), 1);
+        assert_eq!(store.head().unwrap().block_hash(), block_b.block_hash());
     }
 
     #[test]

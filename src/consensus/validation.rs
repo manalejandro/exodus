@@ -174,7 +174,7 @@ pub fn validate_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{make_claim, Checkpoint, CheckpointProposal, DeviceTier, Precision};
+    use crate::models::CheckpointProposal;
 
     #[test]
     fn genesis_recognised() {

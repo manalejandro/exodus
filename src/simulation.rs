@@ -192,4 +192,23 @@ mod tests {
             assert_eq!(a.next_u64(), b.next_u64());
         }
     }
+
+    #[test]
+    fn multi_node_simulations_converge() {
+        let base = std::env::temp_dir().join(format!("exodus-sim-dbg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut cfg = crate::config::config_from_env();
+        cfg.inference = false;
+        cfg.sync_request_interval_seconds = 0.05;
+        for n in [2usize, 3, 4, 6] {
+            let dir = base.join(format!("run-{n}"));
+            let res = simulate(n, 15, Some(7), 2, Some(cfg.clone()), Some(dir));
+            eprintln!("N={n}: {} | {}", res.summary(), res.detail);
+            assert!(
+                res.consistent,
+                "nodes did not converge for N={n}: {}",
+                res.detail
+            );
+        }
+    }
 }

@@ -23,6 +23,7 @@ pub struct ExodusConfig {
     pub claim_dedup_window: i64,
     pub active_peer_window: i64,
     pub heartbeat_seconds: f64,
+    pub sync_request_interval_seconds: f64,
 
     pub node_host: String,
     pub node_port: u16,
@@ -122,6 +123,7 @@ pub fn config_from_env() -> ExodusConfig {
         claim_dedup_window: env_int("CLAIM_DEDUP_WINDOW", 256),
         active_peer_window: env_int("ACTIVE_PEER_WINDOW", 5),
         heartbeat_seconds: env_float("HEARTBEAT_SECONDS", 10.0),
+        sync_request_interval_seconds: env_float("SYNC_REQUEST_INTERVAL_SECONDS", 5.0),
         node_host: env_str("NODE_HOST", "0.0.0.0"),
         node_port: env_int("NODE_PORT", 52514) as u16,
         peers: env_list("PEERS", Vec::new()),
