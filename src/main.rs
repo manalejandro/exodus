@@ -176,6 +176,28 @@ fn main() {
                 "listening on {}:{} (api on {}:{})",
                 cfg.node_host, cfg.node_port, cfg.api_host, cfg.api_port
             );
+            let model_dir = cfg.models_dir();
+            let models: Vec<String> = std::fs::read_dir(&model_dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| {
+                            let name = e.file_name().to_string_lossy().into_owned();
+                            (!name.is_empty()).then_some(name)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!(
+                "inference : EXODUS_INFERENCE={} llama_bin={} model_dir={} models=[{}]",
+                cfg.inference,
+                cfg.llama_bin,
+                model_dir.display(),
+                models.join(", "),
+            );
+            println!(
+                "distributed: EXODUS_DISTRIBUTED_INFERENCE={} gather_timeout={}s",
+                cfg.distributed_inference, cfg.distributed_timeout_seconds
+            );
             let rt = tokio::runtime::Runtime::new().expect("runtime");
             rt.block_on(async move {
                 coord.run(api).await;

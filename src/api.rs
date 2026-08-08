@@ -360,16 +360,24 @@ async fn chat(State(c): State<Coord>, Json(req): Json<ChatRequest>) -> impl Into
             Json(json!({ "error": "no messages" })),
         );
     }
-    let model = match req.model.as_deref() {
-        Some(m) if safe_model_name(m) => m.to_string(),
-        Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid model name" })),
-            )
-        }
-        None => model_files(&c).into_iter().next().unwrap_or_else(|| "auto".to_string()),
-    };
+let model = match req.model.as_deref() {
+            Some(m) if safe_model_name(m) => m.to_string(),
+            Some(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid model name" })),
+                )
+            }
+            None => model_files(&c).into_iter().next().unwrap_or_else(|| "auto".to_string()),
+        };
+        eprintln!(
+            "[chat] node={} model={} turns={} inference={} distributed={}",
+            c.identity.node_id,
+            model,
+            req.messages.len(),
+            c.config.inference,
+            c.config.distributed_inference,
+        );
     let turns: Vec<crate::inference::ChatTurn> = req
         .messages
         .iter()
@@ -384,7 +392,10 @@ async fn chat(State(c): State<Coord>, Json(req): Json<ChatRequest>) -> impl Into
 async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTurn]) -> Value {
     let gpu = c.gpu_info();
     let files = model_files(c);
-    let stub = |reason: &str| chat_stub(c, &gpu, &files, model, reason);
+    let stub = |reason: &str| {
+        eprintln!("[chat] node={} stub: {reason}", c.identity.node_id);
+        chat_stub(c, &gpu, &files, model, reason)
+    };
     let Some(model_path) = model_path_for(c, model) else {
         return stub("model file not present");
     };
