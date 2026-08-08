@@ -15,6 +15,11 @@ pub const FORKS: &str = "exodus/forks";
 pub const INFER_REQUESTS: &str = "exodus/infer/requests";
 pub const INFER_RESPONSES: &str = "exodus/infer/responses";
 
+/// Lightweight node telemetry (CPU/mem/GPU + process count).  Broadcast by the
+/// coordinator so dashboards can show reachable capacity and total distributed
+/// memory.  Also outside [`ALL_TOPICS`]: it is advisory, not consensus input.
+pub const HEALTH: &str = "exodus/health";
+
 pub const ALL_TOPICS: [&str; 7] = [
     CLAIMS,
     PROPOSALS,

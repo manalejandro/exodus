@@ -391,6 +391,25 @@ pub struct InferenceResponse {
     pub error: Option<String>,
 }
 
+/// Node telemetry broadcast on [`crate::consensus::topics::HEALTH`] so every
+/// dashboard can show the reachable compute capacity: how many processes the
+/// network could run and how much memory it has in total.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeStats {
+    pub node_id: String,
+    /// Advertised number of CPU cores available for inference work.
+    pub cpu_cores: u64,
+    /// Advertised total system RAM, in MB.
+    pub mem_total_mb: u64,
+    /// Number of compute processes this node can host at once (LLM slots).
+    pub processes: u64,
+    /// Advertised total GPU VRAM, in MB (0 when no GPU).
+    pub gpu_vram_mb: u64,
+    /// True when the node reports a usable GPU.
+    pub gpu_available: bool,
+}
+
 /// A typed protocol message, serialised to JSON for the transport.
 #[derive(Debug, Clone)]
 pub enum Message {

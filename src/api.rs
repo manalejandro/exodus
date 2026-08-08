@@ -85,6 +85,15 @@ async fn status(State(c): State<Coord>) -> Json<Value> {
     Json(c.status())
 }
 
+/// Live node telemetry + distributed capacity across announced peers.
+async fn system(State(c): State<Coord>) -> Json<Value> {
+    Json(json!({
+        "node_id": c.identity.node_id,
+        "local": c.node_telemetry(),
+        "distributed": c.distributed_capacity(),
+    }))
+}
+
 async fn credits(State(c): State<Coord>) -> Json<Value> {
     Json(c.entitlement())
 }
@@ -711,6 +720,7 @@ fn app(c: Coord) -> Router {
         .route("/exodus/dash.html", get(dash))
         .route("/exodus/chat", post(chat))
         .route("/exodus/status", get(status))
+        .route("/exodus/system", get(system))
         .route("/exodus/credits", get(credits))
         .route("/exodus/network", get(network))
         .route("/exodus/ledger", get(ledger))

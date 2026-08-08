@@ -14,5 +14,6 @@ pub mod models;
 pub mod network;
 pub mod rewards;
 pub mod simulation;
+pub mod system;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

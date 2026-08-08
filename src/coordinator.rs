@@ -18,7 +18,7 @@ use crate::inference::ChatTurn;
 use crate::ledger::ChainStore;
 use crate::models::{
     self, ContributionClaim, DeviceTier, InferenceRequest, InferenceResponse, InferenceTurn,
-    Message, Precision, SignedContribution, WorkType,
+    Message, NodeStats, Precision, SignedContribution, WorkType,
 };
 use crate::network::{Subscription, Transport};
 use crate::rewards::RewardEngine;
@@ -45,6 +45,11 @@ pub struct ExodusCoordinator {
     /// Bounds how many remote completions run at once so a flood of fan-out
     /// requests cannot spawn unbounded llama-cli processes.
     infer_slots: tokio::sync::Semaphore,
+    /// System telemetry for the dashboard: CPU sampling, memory, distributed
+    /// stats aggregated from peer [`NodeStats`] announcements.
+    cpu_sampler: crate::system::CpuSampler,
+    /// Most recent telemetry announced by each peer (node_id → stats).
+    peer_stats: Mutex<HashMap<String, (NodeStats, Instant)>>,
 }
 
 /// Decode a raw JSON payload into a typed protocol message for a topic.
@@ -129,6 +134,8 @@ impl ExodusCoordinator {
             gpu_cache: Mutex::new(None),
             infer_tx: Mutex::new(HashMap::new()),
             infer_slots,
+            cpu_sampler: crate::system::CpuSampler::new(),
+            peer_stats: Mutex::new(HashMap::new()),
         })
     }
 
@@ -178,6 +185,14 @@ impl ExodusCoordinator {
             Arc::new(move |_t, value| collector.on_infer_response(value)),
         );
         subs.push(sub);
+        // Node telemetry: absorb peer capacity announcements so the dashboard
+        // can show reachable processes + total distributed memory.
+        let health = self.clone();
+        let sub = self.transport.subscribe(
+            topics::HEALTH,
+            Arc::new(move |_t, value| health.on_node_stats(value)),
+        );
+        subs.push(sub);
     }
 
     pub fn disconnect(&self) {
@@ -215,6 +230,127 @@ impl ExodusCoordinator {
             *cache = Some(crate::gpu::detect(self.config.gpu_layers));
         }
         cache.clone().unwrap_or_default()
+    }
+
+    // ------------------------------------------------------- node telemetry
+
+    /// Local capacity + live usage as this node currently sees it: CPU %, RAM,
+    /// process RSS and GPU usage, plus how many compute processes this node can
+    /// host.  Used both for the dashboard and for the distributed aggregate.
+    pub fn node_telemetry(&self) -> Value {
+        let mem = crate::system::memory();
+        let mem_total = mem["total_mb"].as_u64().unwrap_or(0);
+        let mem_used = mem["used_mb"].as_u64();
+        let process_rss = mem["process_rss_mb"].as_u64().unwrap_or(0);
+        let gpu = self.gpu_info();
+        let usage = crate::gpu::live_usage(&gpu);
+        let vram_total: u64 = gpu
+            .devices
+            .iter()
+            .map(|d| d.memory_total_mb)
+            .sum();
+        let vram_used: u64 = usage["devices"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|d| d["memory_used_mb"].as_u64().unwrap_or(0))
+                    .sum()
+            })
+            .unwrap_or(0);
+        let processes_total: u64 = gpu
+            .devices
+            .len()
+            .max(1) as u64
+            + self.config.max_concurrent_inference as u64;
+        json!({
+            "cpu_percent": self.cpu_sampler.percent(),
+            "cpu_cores": crate::system::cpu_cores(),
+            "mem_total_mb": mem_total,
+            "mem_used_mb": mem_used,
+            "mem_percent": mem["percent"],
+            "process_rss_mb": process_rss,
+            "processes": processes_total,
+            "gpu": usage,
+            "gpu_vram_mb": vram_total,
+            "gpu_vram_used_mb": vram_used,
+        })
+    }
+
+    /// Announce this node's telemetry so peers can compute the distributed
+    /// totals.  Sent on a regular cadence by [`ExodusCoordinator::run`].
+    pub fn announce_telemetry(&self) {
+        let mem = crate::system::memory();
+        let gpu = self.gpu_info();
+        let stats = NodeStats {
+            node_id: self.identity.node_id.clone(),
+            cpu_cores: crate::system::cpu_cores(),
+            mem_total_mb: mem["total_mb"].as_u64().unwrap_or(0),
+            processes: gpu.devices.len().max(1) as u64
+                + self.config.max_concurrent_inference as u64,
+            gpu_vram_mb: gpu.devices.iter().map(|d| d.memory_total_mb).sum(),
+            gpu_available: gpu.available,
+        };
+        let payload = serde_json::to_value(&stats).unwrap_or_default();
+        let _ = self.transport.publish(topics::HEALTH, &payload);
+    }
+
+    /// Absorb a peer's capacity announcement, pruning stale entries.
+    fn on_node_stats(&self, value: Value) {
+        let Ok(stats) = serde_json::from_value::<NodeStats>(value) else {
+            return;
+        };
+        if stats.node_id == self.identity.node_id {
+            return;
+        }
+        let mut map = self.peer_stats.lock().unwrap();
+        map.insert(stats.node_id.clone(), (stats, Instant::now()));
+        let cutoff = Instant::now() - Duration::from_secs(30);
+        map.retain(|_, (_, at)| *at > cutoff);
+    }
+
+    /// Aggregate capacity across every peer that has announced recently,
+    /// expressed as "reachable processes" and "total distributed memory".
+    pub fn distributed_capacity(&self) -> Value {
+        let mem = crate::system::memory();
+        let gpu = self.gpu_info();
+        let local = NodeStats {
+            node_id: self.identity.node_id.clone(),
+            cpu_cores: crate::system::cpu_cores(),
+            mem_total_mb: mem["total_mb"].as_u64().unwrap_or(0),
+            processes: gpu.devices.len().max(1) as u64
+                + self.config.max_concurrent_inference as u64,
+            gpu_vram_mb: gpu.devices.iter().map(|d| d.memory_total_mb).sum(),
+            gpu_available: gpu.available,
+        };
+        let mut nodes: Vec<NodeStats> = Vec::new();
+        nodes.push(local);
+        let mut peers = {
+            let map = self.peer_stats.lock().unwrap();
+            map.values().map(|(s, _)| s.clone()).collect::<Vec<_>>()
+        };
+        nodes.append(&mut peers);
+        let node_count = nodes.len();
+        let cores: u64 = nodes.iter().map(|n| n.cpu_cores).sum();
+        let mem_mb: u64 = nodes.iter().map(|n| n.mem_total_mb).sum();
+        let processes: u64 = nodes.iter().map(|n| n.processes).sum();
+        let vram_mb: u64 = nodes.iter().map(|n| n.gpu_vram_mb).sum();
+        let gpu_nodes = nodes.iter().filter(|n| n.gpu_available).count();
+        json!({
+            "node_count": node_count,
+            "cpu_cores": cores,
+            "mem_total_mb": mem_mb,
+            "processes": processes,
+            "gpu_vram_mb": vram_mb,
+            "gpu_nodes": gpu_nodes,
+            "nodes": nodes.iter().map(|n| json!({
+                "node_id": n.node_id,
+                "cpu_cores": n.cpu_cores,
+                "mem_total_mb": n.mem_total_mb,
+                "processes": n.processes,
+                "gpu_vram_mb": n.gpu_vram_mb,
+                "gpu_available": n.gpu_available,
+            })).collect::<Vec<_>>(),
+        })
     }
 
     // ------------------------------------------------------ contribution input
@@ -589,6 +725,7 @@ impl ExodusCoordinator {
         );
         loop {
             consensus.tick();
+            self.announce_telemetry();
             if consensus.is_sealer() {
                 consensus.propose_now();
             }

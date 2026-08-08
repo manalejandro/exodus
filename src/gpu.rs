@@ -19,6 +19,13 @@ pub struct GpuDevice {
     pub memory_total_mb: u64,
 }
 
+/// A process currently running on a detected GPU (from `nvidia-smi`).
+#[derive(Debug, Clone, Default)]
+pub struct GpuProcess {
+    pub pid: u64,
+    pub memory_used_mb: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GpuInfo {
     pub available: bool,
@@ -55,6 +62,83 @@ impl GpuInfo {
             })).collect::<Vec<_>>(),
         })
     }
+}
+
+/// Live GPU usage: memory in use, utilization and running processes as
+/// reported by `nvidia-smi`.  Returns an empty report when no GPU is visible.
+pub fn live_usage(info: &GpuInfo) -> Value {
+    if !info.available {
+        return json!({
+            "available": false,
+            "devices": [],
+            "processes": [],
+        });
+    }
+    let (used, utilization) = query_gpu_usage();
+    let processes = query_gpu_processes();
+    json!({
+        "available": true,
+        "devices": info
+            .devices
+            .iter()
+            .zip(used.iter().zip(utilization.iter()))
+            .map(|(d, (used_mb, util))| json!({
+                "name": d.name,
+                "memory_total_mb": d.memory_total_mb,
+                "memory_used_mb": used_mb,
+                "utilization_percent": util,
+            }))
+            .collect::<Vec<_>>(),
+        "processes": processes
+            .iter()
+            .map(|p| json!({ "pid": p.pid, "memory_used_mb": p.memory_used_mb }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Query per-device used memory (MB) and utilization (%) from `nvidia-smi`.
+fn query_gpu_usage() -> (Vec<u64>, Vec<u64>) {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return (Vec::new(), Vec::new());
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut used = Vec::new();
+    let mut util = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split(',');
+        used.push(fields.next().unwrap_or("0").trim().parse().unwrap_or(0));
+        util.push(fields.next().unwrap_or("0").trim().parse().unwrap_or(0));
+    }
+    (used, util)
+}
+
+/// List of processes running on the GPU from `nvidia-smi`.
+fn query_gpu_processes() -> Vec<GpuProcess> {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .map(|line| {
+            let mut fields = line.split(',').map(|s| s.trim());
+            GpuProcess {
+                pid: fields.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                memory_used_mb: fields.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            }
+        })
+        .collect()
 }
 
 /// Detect the GPU exposed to this process.
