@@ -75,7 +75,19 @@
   #events .ev { color: var(--accent); }
   #events .er { color: var(--err); }
   footer { margin-top: 2rem; color: var(--dim); font-size: 12px; }
+  a.gh { font-size: .75rem; color: var(--dim); border: 1px solid var(--line); border-radius: 999px; padding: .2rem .7rem; text-decoration: none; }
+  a.gh:hover { color: var(--link); border-color: var(--link); }
   .chip { display: inline-block; background: #10141b; border: 1px solid var(--line); border-radius: 999px; padding: .15rem .6rem; font-size: 11px; margin: .1rem .2rem .1rem 0; }
+  /* resource usage bars (CPU / RAM / GPU) */
+  .meter { margin: .35rem 0; }
+  .meter .cap { display: flex; justify-content: space-between; font-size: 11.5px; margin-bottom: .2rem; }
+  .meter .cap b { color: var(--fg); font-weight: normal; }
+  .bar { height: 6px; background: #10141b; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: linear-gradient(90deg, #2c6a44, var(--accent)); border-radius: 999px; transition: width .5s ease; }
+  .bar.warn > i { background: linear-gradient(90deg, #8a6a2c, var(--warn)); }
+  .bar.hot > i { background: linear-gradient(90deg, #6a2c2a, var(--err)); }
+  .proc { display: inline-flex; align-items: baseline; gap: .4rem; background: #11161f; border: 1px solid var(--line); border-radius: 999px; padding: .15rem .55rem; font-size: 11.5px; color: var(--fg); margin: .1rem .15rem .1rem 0; }
+  .proc .pid { color: var(--dim); }
   .drop { border: 2px dashed var(--line); border-radius: 10px; padding: .9rem; text-align: center; color: var(--dim); }
   .drop.over { border-color: var(--accent); color: var(--accent); }
   .gpu.ok { color: var(--accent); }
@@ -89,7 +101,7 @@
   <h1>exodus node <span id="health" class="badge">…</span></h1>
   <span id="nodeid" class="muted"></span>
   <span class="muted" id="clock"></span>
-  <span style="margin-left:auto"><a href="/">chat</a> &middot; dashboard</span>
+  <span style="margin-left:auto"><a class="gh" href="https://github.com/manalejandro/exodus" target="_blank" rel="noopener noreferrer">github</a> &middot; <a href="/">chat</a> &middot; dashboard</span>
 </header>
 
 <main class="grid">
@@ -107,6 +119,14 @@
   <section class="card">
     <h2>gpu</h2>
     <dl class="kv" id="gpu"></dl>
+  </section>
+
+  <section class="card">
+    <h2>system</h2>
+    <dl class="kv" id="system"></dl>
+    <div id="meters"></div>
+    <h2 style="margin-top:.9rem">distributed capacity</h2>
+    <dl class="kv" id="distributed"></dl>
   </section>
 
   <section class="card">
@@ -328,6 +348,67 @@ async function loadGpu() {
   renderModelSelect();
 }
 
+async function loadSystem() {
+  const s = await api("system");
+  const l = s.local || {};
+  const mem = l.mem_total_mb || 0;
+  const memUsed = l.mem_used_mb || 0;
+  const memPct = l.mem_percent || (mem ? (memUsed / mem) * 100 : 0);
+  const gpu = l.gpu || {};
+  const vramTotal = l.gpu_vram_mb || 0;
+  const vramUsed = l.gpu_vram_used_mb || 0;
+  const vramPct = vramTotal ? (vramUsed / vramTotal) * 100 : 0;
+  kv($("system"), [
+    ["cpu", l.cpu_percent != null ? l.cpu_percent.toFixed(1) + " %" : "—"],
+    ["cpu cores", l.cpu_cores ?? "—"],
+    ["memory", fmtMB(memUsed) + " / " + fmtMB(mem)],
+    ["process rss", fmtMB(l.process_rss_mb)],
+    ["gpu vram", fmtMB(vramUsed) + " / " + fmtMB(vramTotal)],
+    ["gpu processes", (gpu.processes || []).length],
+  ]);
+  $("meters").innerHTML =
+    meter("cpu", l.cpu_percent || 0) +
+    meter("memory", memPct) +
+    meter("gpu vram", vramPct, vramTotal ? "" : "disabled");
+  $("distributed").innerHTML = distributedKV(s.distributed || {});
+}
+
+function meter(label, pct, extra) {
+  const v = Math.max(0, Math.min(100, Number(pct) || 0));
+  const cls = v >= 90 ? "hot" : v >= 70 ? "warn" : "";
+  const cap = (label === "cpu" || label === "memory") ? " %" : "";
+  return `<div class="meter"><div class="cap"><b>${esc(label)}</b>` +
+    `<span>${extra ? "—" : v.toFixed(0) + cap}</span></div>` +
+    `<div class="bar ${cls} ${extra ? "" : "x"}"><i style="width:${extra ? 0 : v}%"></i></div></div>`;
+}
+
+function distributedKV(d) {
+  const nodes = d.nodes || [];
+  const nodeList = nodes.map((n) =>
+    `<span class="chip" title="${esc(n.node_id)}">${esc(shortId(n.node_id))} · ${n.cpu_cores}c · ${fmtMB(n.mem_total_mb)} · ${n.gpu_available ? "gpu" : "cpu"}</span>`).join(" ");
+  return [
+    ["nodes", d.node_count],
+    ["cpu cores", d.cpu_cores],
+    ["memory total", fmtMB(d.mem_total_mb)],
+    ["processes", d.processes],
+    ["gpu vram", fmtMB(d.gpu_vram_mb)],
+    ["gpu nodes", d.gpu_nodes],
+    ["peers", nodeList, "raw"],
+  ].map(([k, v, cls]) =>
+    `<dt>${esc(k)}</dt><dd class="${cls === "raw" ? "" : esc(cls || "")}">${cls === "raw" ? v : esc(v)}</dd>`).join("");
+}
+
+function fmtMB(mb) {
+  const n = Number(mb) || 0;
+  if (n >= 1024) return (n / 1024).toFixed(1) + " GB";
+  return n.toFixed(0) + " MB";
+}
+
+function shortId(id) {
+  const s = String(id || "");
+  return s.length > 16 ? s.slice(0, 8) + "…" + s.slice(-6) : s;
+}
+
 async function loadNetwork() {
   const c = await api("consensus");
   kv($("consensus"), [
@@ -369,7 +450,7 @@ async function loadClaims() {
 }
 
 async function refresh() {
-  await Promise.allSettled([loadStatus(), loadCredits(), loadGpu(), loadNetwork(), loadLedger(), loadClaims()]);
+  await Promise.allSettled([loadStatus(), loadCredits(), loadGpu(), loadSystem(), loadNetwork(), loadLedger(), loadClaims()]);
 }
 
 function renderModels() {

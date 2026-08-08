@@ -24,6 +24,8 @@
   .badge.bad { background: #451d1b; color: var(--err); }
   .muted { color: var(--dim); }
   header .right { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
+  header .right a.github { font-size: .75rem; color: var(--dim); border: 1px solid var(--line); border-radius: 999px; padding: .2rem .7rem; text-decoration: none; }
+  header .right a.github:hover { color: var(--link); border-color: var(--link); }
   #statusbar { display: flex; gap: 1rem; padding: .4rem 1.5rem; border-bottom: 1px solid var(--line); color: var(--dim); font-size: 12px; flex-wrap: wrap; }
   #statusbar .chip { border: 1px solid var(--line); border-radius: 999px; padding: .1rem .55rem; }
   #statusbar .gpu.ok { color: var(--accent); border-color: #2c6a44; }
@@ -69,7 +71,10 @@
   <h1>exodus chat</h1>
   <span id="nodeid" class="muted"></span>
   <span id="health" class="badge">…</span>
-  <span class="right"><a href="/exodus/dash.html">dashboard</a></span>
+  <span class="right">
+    <a class="github" href="https://github.com/manalejandro/exodus" target="_blank" rel="noopener noreferrer">github</a>
+    <a href="/exodus/dash.html">dashboard</a>
+  </span>
 </header>
 
 <div id="statusbar">
