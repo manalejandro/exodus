@@ -11,37 +11,38 @@
     --warn: #ffd479; --err: #ff7b72; --link: #79b8ff;
   }
   * { box-sizing: border-box; }
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); color: var(--fg); margin: 0; padding: 1.5rem 2rem 4rem; font-size: 14px; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); color: var(--fg); margin: 0; padding: 2rem clamp(1rem, 4vw, 3rem) 5rem; font-size: 14px; line-height: 1.55; }
   a { color: var(--link); }
-  header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem; }
+  header { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
   h1 { color: var(--accent); font-size: 1.35rem; margin: 0; }
   h1 .badge { font-size: .7rem; vertical-align: middle; margin-left: .5rem; padding: .15rem .5rem; border-radius: 999px; }
   .badge.ok { background: #12351f; color: var(--accent); }
   .badge.bad { background: #451d1b; color: var(--err); }
   .muted { color: var(--dim); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 1rem; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.15rem; }
-  .card h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 .6rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 1.25rem; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 1.1rem 1.25rem; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+  .card h2 { font-size: .76rem; text-transform: uppercase; letter-spacing: .09em; color: var(--dim); margin: 0 0 .7rem; }
   .card h2 .right { float: right; text-transform: none; letter-spacing: 0; font-weight: normal; }
   .card h2 button { float: right; }
-  .kv { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; }
-  .kv dt { color: var(--dim); }
-  .kv dd { margin: 0; word-break: break-all; }
+  .kv { display: grid; grid-template-columns: minmax(max-content, 130px) 1fr; gap: .35rem 1rem; }
+  .kv dt { color: var(--dim); overflow-wrap: anywhere; }
+  .kv dd { margin: 0; word-break: break-word; overflow-wrap: anywhere; }
+  .kv dd .addr { display: inline-flex; margin: .1rem .15rem .1rem 0; }
   .kv dd.ok { color: var(--accent); }
   .kv dd.bad { color: var(--err); }
   .wide { grid-column: 1 / -1; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { text-align: left; padding: .3rem .45rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: .45rem .55rem; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--dim); font-weight: normal; }
-  td.hash, td.mono { word-break: break-all; }
+  td.hash, td.mono { word-break: break-all; overflow-wrap: anywhere; }
   tr:hover td { background: #1b202b; }
-  .scroll { max-height: 340px; overflow: auto; }
-  form { display: flex; flex-direction: column; gap: .55rem; }
-  .row { display: grid; grid-template-columns: 1fr 1fr; gap: .55rem; }
-  label { display: flex; flex-direction: column; gap: .25rem; font-size: .72rem; color: var(--dim); }
+  .scroll { max-height: 360px; overflow: auto; }
+  form { display: flex; flex-direction: column; gap: .6rem; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+  label { display: flex; flex-direction: column; gap: .3rem; font-size: .72rem; color: var(--dim); }
   input, select, button {
     background: #10141b; color: var(--fg); border: 1px solid var(--line);
-    border-radius: 6px; padding: .45rem .6rem; font: inherit; font-size: 13px; width: 100%;
+    border-radius: 7px; padding: .5rem .65rem; font: inherit; font-size: 13px; width: 100%;
   }
   input:focus, select:focus { outline: 1px solid var(--accent); }
   button { cursor: pointer; background: #1d2733; border-color: #33404f; width: auto; }
@@ -49,23 +50,37 @@
   button.primary { background: #12351f; border-color: #2c6a44; color: var(--accent); }
   button.danger { background: #3a1d1c; border-color: #6a2c2a; color: var(--err); }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  .flash { padding: .45rem .6rem; border-radius: 6px; font-size: 12px; margin-top: .5rem; word-break: break-all; }
+  /* address chips: node ids & hashes get a subtle pill with a copy button */
+  .addr {
+    display: inline-flex; align-items: baseline; gap: .35rem;
+    background: #11161f; border: 1px solid var(--line); border-radius: 999px;
+    padding: .1rem .15rem .1rem .55rem; font-size: 11.5px; color: var(--link);
+    margin: .1rem 0; max-width: 100%;
+  }
+  .addr .short { word-break: break-all; overflow-wrap: anywhere; }
+  .addr button {
+    width: auto; padding: .05rem .45rem; border-radius: 999px;
+    font-size: 11px; background: #10141b; border-color: var(--line);
+  }
+  .addr button:hover { border-color: var(--accent); color: var(--accent); }
+  .addr button.copied { border-color: var(--accent); color: var(--accent); }
+  .flash { padding: .55rem .7rem; border-radius: 8px; font-size: 12.5px; margin-top: .6rem; word-break: break-all; }
   .flash.ok { background: #12351f; color: var(--accent); }
   .flash.err { background: #3a1d1c; color: var(--err); }
-  .toolbar { display: flex; gap: .5rem; align-items: center; margin-bottom: .5rem; flex-wrap: wrap; }
-  .toolbar input { width: 200px; }
+  .toolbar { display: flex; gap: .6rem; align-items: center; margin-bottom: .6rem; flex-wrap: wrap; }
+  .toolbar input { width: 220px; }
   .toolbar .muted { flex: 1; text-align: right; }
-  #events { max-height: 260px; overflow: auto; font-size: 12px; line-height: 1.5; }
-  #events div { border-bottom: 1px dashed var(--line); padding: .15rem 0; }
+  #events { max-height: 280px; overflow: auto; font-size: 12px; line-height: 1.6; }
+  #events div { border-bottom: 1px dashed var(--line); padding: .2rem 0; }
   #events .ev { color: var(--accent); }
   #events .er { color: var(--err); }
-  footer { margin-top: 1.5rem; color: var(--dim); font-size: 12px; }
-  .chip { display: inline-block; background: #10141b; border: 1px solid var(--line); border-radius: 999px; padding: .1rem .5rem; font-size: 11px; }
-  .drop { border: 2px dashed var(--line); border-radius: 8px; padding: .8rem; text-align: center; color: var(--dim); }
+  footer { margin-top: 2rem; color: var(--dim); font-size: 12px; }
+  .chip { display: inline-block; background: #10141b; border: 1px solid var(--line); border-radius: 999px; padding: .15rem .6rem; font-size: 11px; margin: .1rem .2rem .1rem 0; }
+  .drop { border: 2px dashed var(--line); border-radius: 10px; padding: .9rem; text-align: center; color: var(--dim); }
   .drop.over { border-color: var(--accent); color: var(--accent); }
   .gpu.ok { color: var(--accent); }
   .gpu.no { color: var(--dim); }
-  @media (max-width: 720px) { .row { grid-template-columns: 1fr; } body { padding: 1rem; } }
+  @media (max-width: 720px) { .row { grid-template-columns: 1fr; } body { padding: 1.2rem 1rem 4rem; } .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -229,8 +244,28 @@ async function api(path, opts) {
 
 function kv(el, pairs) {
   el.innerHTML = pairs.map(([k, v, cls]) =>
-    `<dt>${esc(k)}</dt><dd class="${esc(cls || "")}">${esc(v)}</dd>`).join("");
+    `<dt>${esc(k)}</dt><dd class="${esc(cls || "")}">${cls === "raw" ? v : esc(v)}</dd>`).join("");
 }
+
+/** Abbreviate a long id/hash as a click-to-copy address chip. */
+function addr(v) {
+  const s = String(v ?? "");
+  if (!s) return '<span class="muted">—</span>';
+  const shown = s.length > 44 ? s.slice(0, 22) + "…" + s.slice(-18) : s;
+  return `<span class="addr" title="${esc(s)}"><span class="short">${esc(shown)}</span>` +
+         `<button type="button" data-copy="${esc(s)}" title="copy">⧉</button></span>`;
+}
+
+// click-to-copy for any [data-copy]
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-copy]");
+  if (!b) return;
+  const text = b.getAttribute("data-copy");
+  navigator.clipboard.writeText(text).then(() => {
+    b.classList.add("copied"); b.textContent = "✓";
+    setTimeout(() => { b.classList.remove("copied"); b.textContent = "⧉"; }, 1200);
+  }).catch(() => {});
+});
 
 function statusBadge() {
   const el = $("health");
@@ -242,14 +277,14 @@ function statusBadge() {
 async function loadStatus() {
   const s = await api("status");
   state.ok = s.verified_chain;
-  $("nodeid").textContent = "node " + s.node_id;
+  $("nodeid").innerHTML = "node " + addr(s.node_id);
   statusBadge();
   kv($("status"), [
     ["node_id", s.node_id],
     ["node_name", s.node_name],
     ["ledger height", s.ledger_height],
-    ["ledger head", s.ledger_head, "hash"],
-    ["sealer", s.sealer + " (view " + s.view + ")"],
+    ["ledger head", addr(s.ledger_head), "raw"],
+    ["sealer", addr(s.sealer) + " · view " + s.view, "raw"],
     ["is_sealer", s.is_sealer],
     ["quorum / committee", s.quorum_size + " / " + s.committee_size],
     ["peers", s.peer_count],
@@ -297,16 +332,16 @@ async function loadNetwork() {
   const c = await api("consensus");
   kv($("consensus"), [
     ["view", c.view],
-    ["sealer", c.sealer],
+    ["sealer", addr(c.sealer), "raw"],
     ["is_sealer", c.is_sealer],
     ["quorum_size", c.quorum_size],
-    ["committee", (c.committee || []).join(", ") || "—"],
-    ["peers", (c.peers || []).join(", ") || "—"],
+    ["committee", (c.committee || []).map(addr).join(" ") || "—", "raw"],
+    ["peers", (c.peers || []).map(addr).join(" ") || "—", "raw"],
     ["pending claims", c.pending_claims],
   ]);
   const n = await api("network");
   const rows = (n.participants || []).map((p) =>
-    `<tr><td class="hash">${esc(p.node_id)}</td><td>${esc(fmt(p.credits))}</td><td>${esc(p.priority_tier)}</td><td>${esc(fmt(p.ai_time_seconds))}s</td></tr>`).join("");
+    `<tr><td>${addr(p.node_id)}</td><td>${esc(fmt(p.credits))}</td><td>${esc(p.priority_tier)}</td><td>${esc(fmt(p.ai_time_seconds))}s</td></tr>`).join("");
   $("participants").innerHTML = rows || `<tr><td colspan="4" class="muted">no participants yet</td></tr>`;
 }
 
@@ -314,7 +349,7 @@ async function loadLedger() {
   const l = await api("ledger?limit=30");
   $("ledger-summary").textContent = "height " + l.height;
   $("ledger").innerHTML = (l.blocks || []).map((b) =>
-    `<tr><td>${b.height}</td><td>${b.epoch}</td><td class="hash">${esc(b.sealed_by)}</td><td>${b.claims}</td><td>${b.signatures}</td><td class="hash">${esc(b.block_hash)}</td></tr>`).join("")
+    `<tr><td>${b.height}</td><td>${b.epoch}</td><td>${addr(b.sealed_by)}</td><td>${b.claims}</td><td>${b.signatures}</td><td>${addr(b.block_hash)}</td></tr>`).join("")
     || `<tr><td colspan="6" class="muted">empty chain</td></tr>`;
 }
 
@@ -329,7 +364,7 @@ async function loadClaims() {
   $("claims").innerHTML = (c.claims || []).map((r) => {
     let j = {};
     try { j = JSON.parse(r.claim_json); } catch (e) {}
-    return `<tr><td>${r.height}</td><td class="hash">${esc(r.node_id)}</td><td>${r.seq}</td><td>${esc(fmt(r.cu))}</td><td>${esc(j.model_id || "—")}</td><td>${esc(j.device_tier || "—")}</td></tr>`;
+    return `<tr><td>${r.height}</td><td>${addr(r.node_id)}</td><td>${r.seq}</td><td>${esc(fmt(r.cu))}</td><td>${esc(j.model_id || "—")}</td><td>${esc(j.device_tier || "—")}</td></tr>`;
   }).join("") || `<tr><td colspan="6" class="muted">no claims</td></tr>`;
 }
 
