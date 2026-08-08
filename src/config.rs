@@ -114,7 +114,7 @@ pub fn config_from_env() -> ExodusConfig {
         llama_bin: env_str("LLAMA_BIN", "llama-cli"),
         inference: env_bool("INFERENCE", true),
         max_tokens: env_int("MAX_TOKENS", 256),
-        inference_timeout_seconds: env_float("INFERENCE_TIMEOUT_SECONDS", 120.0),
+        inference_timeout_seconds: env_float("INFERENCE_TIMEOUT_SECONDS", 300.0),
         epoch_seconds: env_float("EPOCH_SECONDS", 30.0),
         election_timeout_seconds: env_float("ELECTION_TIMEOUT_SECONDS", 90.0),
         byzantine: env_bool("BYZANTINE", true),

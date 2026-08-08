@@ -457,7 +457,7 @@ fn chat_stub(
         "models": files,
         "gpu": gpu.to_value(),
         "reply": format!(
-            "[{model}] No inference runtime is bundled in this node yet ({reason}), so I can't generate a real answer.\n\nNode state: {} ({}) with {} model file(s).",
+            "[{model}] Couldn't generate a real answer ({reason}), so this is a state stub.\n\nNode state: {} ({}) with {} model file(s).",
             if gpu.available { "GPU-ready" } else { "CPU-only" },
             gpu.tier_string(),
             files.len(),

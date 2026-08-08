@@ -82,11 +82,22 @@ pub fn complete(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    let output = child
+                        .wait_with_output()
+                        .map_err(|e| format!("reading output from {bin}: {e}"))?;
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let mut tail: Vec<char> = stderr.trim().chars().rev().take(300).collect();
+                    tail.reverse();
+                    let tail: String = tail.into_iter().collect();
                     return Err(format!(
-                        "inference timed out after {}s and was killed ({bin}, model {})",
+                        "inference timed out after {}s and was killed ({bin}, model {}){}",
                         config.inference_timeout_seconds,
-                        model_path.display()
+                        model_path.display(),
+                        if tail.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!("; llama-cli stderr tail: {}", tail.trim())
+                        }
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(50));
