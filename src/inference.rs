@@ -70,6 +70,12 @@ pub fn complete(
     cmd.arg("--n-gpu-layers").arg(layers.to_string());
     cmd.arg("--temp").arg("0.6");
     cmd.arg("--no-display-prompt");
+    // Recent llama-cli builds enable conversation mode by default whenever the
+    // model ships a chat template: the `-p` prompt is ignored, the process
+    // switches to interactive input and waits (and never exits) when stdout is
+    // piped, so a normal chat call hangs until the timeout.  `-no-cnv` forces a
+    // single-turn completion that prints to stdout and exits.
+    cmd.arg("-no-cnv");
 
     let timeout = Duration::from_secs_f64(config.inference_timeout_seconds.max(1.0));
     let mut child = cmd
