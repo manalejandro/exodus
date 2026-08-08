@@ -73,9 +73,15 @@ pub fn complete(
     // Recent llama-cli builds enable conversation mode by default whenever the
     // model ships a chat template: the `-p` prompt is ignored, the process
     // switches to interactive input and waits (and never exits) when stdout is
-    // piped, so a normal chat call hangs until the timeout.  `-no-cnv` forces a
-    // single-turn completion that prints to stdout and exits.
+    // piped, so a normal chat call hangs until the timeout.  `-no-cnv` (older
+    // builds) and `-st`/`--single-turn` (newer builds) both force a single-turn
+    // completion that prints to stdout and exits.
     cmd.arg("-no-cnv");
+    cmd.arg("-st");
+    // Never leave stdin inherited: a daemonised exodus often has an open stdin
+    // (docker/systemd), and llama-cli in conversational mode blocks reading it
+    // forever, with no stderr output at all until it times out.
+    cmd.stdin(Stdio::null());
 
     let timeout = Duration::from_secs_f64(config.inference_timeout_seconds.max(1.0));
     let mut child = cmd
