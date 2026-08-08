@@ -60,6 +60,18 @@ impl Precision {
             Precision::Int2 => 0.2,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Precision::Fp32 => "fp32",
+            Precision::Fp16 => "fp16",
+            Precision::Bf16 => "bf16",
+            Precision::Fp8 => "fp8",
+            Precision::Int8 => "int8",
+            Precision::Int4 => "int4",
+            Precision::Int2 => "int2",
+        }
+    }
 }
 
 impl std::str::FromStr for Precision {
@@ -340,6 +352,37 @@ pub struct ForkAlert {
     pub height: i64,
     pub observed_hash_a: String,
     pub observed_hash_b: String,
+}
+
+/// A chat turn broadcast to peers so they can run the same prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// Fan-out request for a distributed completion: every peer runs the same
+/// prompt locally and replies on [`crate::consensus::topics::INFER_RESPONSES`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceRequest {
+    pub request_id: String,
+    pub origin: String,
+    pub model: String,
+    pub max_tokens: i64,
+    pub messages: Vec<InferenceTurn>,
+}
+
+/// A peer's completion for a fan-out request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InferenceResponse {
+    pub request_id: String,
+    pub node_id: String,
+    pub reply: String,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// A typed protocol message, serialised to JSON for the transport.

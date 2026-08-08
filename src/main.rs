@@ -111,6 +111,7 @@ fn main() {
             println!("  seconds of AI time / credit : {}", cfg.seconds_per_credit);
             println!("  networking                  : tcp {}:{}", cfg.node_host, cfg.node_port);
             println!("  api                         : {}:{}", cfg.api_host, cfg.api_port);
+            println!("  distributed inference       : {} (gather timeout {}s)", if cfg.distributed_inference { "enabled" } else { "disabled" }, cfg.distributed_timeout_seconds);
             println!("  model dir                   : {}", cfg.models_dir().display());
             let gpu = exodus::gpu::detect(cfg.gpu_layers);
             println!(

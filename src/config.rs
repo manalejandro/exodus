@@ -15,6 +15,8 @@ pub struct ExodusConfig {
     pub inference: bool,
     pub max_tokens: i64,
     pub inference_timeout_seconds: f64,
+    pub distributed_inference: bool,
+    pub distributed_timeout_seconds: f64,
 
     pub epoch_seconds: f64,
     pub election_timeout_seconds: f64,
@@ -116,6 +118,8 @@ pub fn config_from_env() -> ExodusConfig {
         inference: env_bool("INFERENCE", true),
         max_tokens: env_int("MAX_TOKENS", 256),
         inference_timeout_seconds: env_float("INFERENCE_TIMEOUT_SECONDS", 300.0),
+        distributed_inference: env_bool("DISTRIBUTED_INFERENCE", true),
+        distributed_timeout_seconds: env_float("DISTRIBUTED_TIMEOUT_SECONDS", 30.0),
         epoch_seconds: env_float("EPOCH_SECONDS", 30.0),
         election_timeout_seconds: env_float("ELECTION_TIMEOUT_SECONDS", 90.0),
         byzantine: env_bool("BYZANTINE", true),

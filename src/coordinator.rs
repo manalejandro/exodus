@@ -1,9 +1,11 @@
 //! The exodus coordinator: one object tying together identity, ledger,
 //! consensus, rewards and the transport for a single node.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -12,9 +14,11 @@ use crate::consensus::topics;
 use crate::consensus::{ConsensusProtocol, ConsArc};
 use crate::gpu::GpuInfo;
 use crate::identity::NodeIdentity;
+use crate::inference::ChatTurn;
 use crate::ledger::ChainStore;
 use crate::models::{
-    self, ContributionClaim, DeviceTier, Message, Precision, SignedContribution, WorkType,
+    self, ContributionClaim, DeviceTier, InferenceRequest, InferenceResponse, InferenceTurn,
+    Message, Precision, SignedContribution, WorkType,
 };
 use crate::network::{Subscription, Transport};
 use crate::rewards::RewardEngine;
@@ -35,6 +39,9 @@ pub struct ExodusCoordinator {
     seq: AtomicI64,
     commit_hooks: Arc<Mutex<Vec<CommitHook>>>,
     gpu_cache: Mutex<Option<GpuInfo>>,
+    /// Live fan-out requests: `request_id → channel` where peer completions are
+    /// delivered as they arrive on `topics::INFER_RESPONSES`.
+    infer_tx: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InferenceResponse>>>,
 }
 
 /// Decode a raw JSON payload into a typed protocol message for a topic.
@@ -116,12 +123,13 @@ impl ExodusCoordinator {
             seq: AtomicI64::new(0),
             commit_hooks,
             gpu_cache: Mutex::new(None),
+            infer_tx: Mutex::new(HashMap::new()),
         })
     }
 
     // --------------------------------------------------------------- lifecycle
 
-    pub fn connect(&self) {
+    pub fn connect(self: &Arc<Self>) {
         let consensus = self.consensus.clone();
         let mut subs = self.subscriptions.lock().unwrap();
         for topic in topics::ALL_TOPICS {
@@ -152,6 +160,19 @@ impl ExodusCoordinator {
             );
             subs.push(sub);
         }
+        // Distributed inference fan-out lives outside the consensus loop.
+        let requester = self.clone();
+        let sub = self.transport.subscribe(
+            topics::INFER_REQUESTS,
+            Arc::new(move |_t, value| requester.on_infer_request(value)),
+        );
+        subs.push(sub);
+        let collector = self.clone();
+        let sub = self.transport.subscribe(
+            topics::INFER_RESPONSES,
+            Arc::new(move |_t, value| collector.on_infer_response(value)),
+        );
+        subs.push(sub);
     }
 
     pub fn disconnect(&self) {
@@ -231,6 +252,172 @@ impl ExodusCoordinator {
             .submit_claim(signed)
             .map_err(|e| e.0)?;
         Ok(id)
+    }
+
+    // ---------------------------------------------------- distributed inference
+
+    /// Broadcast a fan-out request and return a channel that receives one
+    /// [`InferenceResponse`] per peer.  The caller owns the response channel
+    /// and must call [`ExodusCoordinator::drop_inference`] when done.
+    pub fn request_inference(
+        &self,
+        request_id: String,
+        model: String,
+        max_tokens: i64,
+        messages: Vec<InferenceTurn>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<InferenceResponse> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.infer_tx.lock().unwrap().insert(request_id.clone(), tx);
+        let request = InferenceRequest {
+            request_id,
+            origin: self.identity.node_id.clone(),
+            model,
+            max_tokens,
+            messages,
+        };
+        let payload = serde_json::to_value(&request).unwrap_or_default();
+        let _ = self.transport.publish(topics::INFER_REQUESTS, &payload);
+        rx
+    }
+
+    /// Stop collecting responses for `request_id`.
+    pub fn drop_inference(&self, request_id: &str) {
+        self.infer_tx.lock().unwrap().remove(request_id);
+    }
+
+    /// Route an inbound fan-out response to the waiting requester.
+    fn on_infer_response(&self, value: Value) {
+        let Ok(response) = serde_json::from_value::<InferenceResponse>(value) else {
+            return;
+        };
+        if response.node_id == self.identity.node_id {
+            return;
+        }
+        let tx = self.infer_tx.lock().unwrap().get(&response.request_id).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(response);
+        }
+    }
+
+    /// Inbound fan-out request: run the completion locally (off the delivery
+    /// thread), publish the result and, on success, log the work as a claim.
+    fn on_infer_request(self: &Arc<Self>, value: Value) {
+        let Ok(request) = serde_json::from_value::<InferenceRequest>(value) else {
+            return;
+        };
+        if request.origin == self.identity.node_id {
+            return;
+        }
+        let me = self.clone();
+        let request = request.clone();
+        thread::spawn(move || me.run_inference_request(&request));
+    }
+
+    fn run_inference_request(self: &Arc<Self>, request: &InferenceRequest) {
+        let started = Instant::now();
+        let result = self.complete_for_request(request);
+        let elapsed = started.elapsed().as_secs_f64();
+        let (reply, error) = match result {
+            Ok(reply) => (reply, None),
+            Err(e) => (String::new(), Some(e)),
+        };
+        let response = InferenceResponse {
+            request_id: request.request_id.clone(),
+            node_id: self.identity.node_id.clone(),
+            reply,
+            error: error.clone(),
+        };
+        let payload = serde_json::to_value(&response).unwrap_or_default();
+        let _ = self.transport.publish(topics::INFER_RESPONSES, &payload);
+        if error.is_none() && self.config.inference {
+            let prompt_chars: usize = request
+                .messages
+                .iter()
+                .map(|m| m.content.chars().count())
+                .sum();
+            self.record_inference_claim(
+                &request.model,
+                prompt_chars,
+                response.reply.chars().count(),
+                elapsed,
+            );
+        }
+    }
+
+    /// Run one completion for a peer's request.  Falls back to a truthful,
+    /// node-specific stub when inference is disabled (or the model file is not
+    /// present locally) so the distributed flow stays alive without a runtime.
+    fn complete_for_request(self: &Arc<Self>, request: &InferenceRequest) -> Result<String, String> {
+        if !self.config.inference {
+            return Ok(format!(
+                "[node:{}] distributed stub (inference disabled)",
+                self.identity.node_id
+            ));
+        }
+        if request.model.is_empty()
+            || request.model.contains('/')
+            || request.model.contains('\\')
+            || request.model.starts_with('.')
+        {
+            return Err(format!("invalid model name '{}'", request.model));
+        }
+        let path = self.config.models_dir().join(&request.model);
+        if !path.is_file() {
+            return Err(format!("model file not present: {}", path.display()));
+        }
+        let turns: Vec<ChatTurn> = request
+            .messages
+            .iter()
+            .map(|m| ChatTurn {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+        let mut cfg = self.config.clone();
+        cfg.max_tokens = request.max_tokens.clamp(1, cfg.max_tokens);
+        crate::inference::complete(&cfg, &self.gpu_info(), &path, &turns)
+    }
+
+    /// Record a completed inference as a contribution claim, best-effort: the
+    /// claim is only submitted when the model's parameter count can be derived
+    /// from its name (so the FLOPS sanity check can pass), and failures are
+    /// swallowed so the chat flow is never blocked by the ledger.
+    pub fn record_inference_claim(
+        &self,
+        model: &str,
+        prompt_chars: usize,
+        reply_chars: usize,
+        seconds: f64,
+    ) {
+        if !self.config.inference {
+            return;
+        }
+        let Some(params_b) = crate::inference::model_params_b(model) else {
+            return;
+        };
+        let precision = crate::inference::model_precision(model);
+        let prompt_tokens = crate::inference::estimate_tokens(prompt_chars);
+        let completion_tokens = crate::inference::estimate_tokens(reply_chars);
+        let flops = crate::inference::estimated_flops(
+            params_b,
+            precision,
+            prompt_tokens,
+            completion_tokens,
+        );
+        let tier = self.gpu_info().tier_string();
+        let _ = self.submit_contribution(
+            model.to_string(),
+            params_b,
+            precision.name().to_string(),
+            prompt_tokens,
+            completion_tokens,
+            seconds.max(0.001),
+            flops,
+            tier,
+            "text_generation".to_string(),
+            None,
+            None,
+        );
     }
 
     // ----------------------------------------------------------------- queries
@@ -343,5 +530,112 @@ impl ExodusCoordinator {
             }
             tokio::time::sleep(period).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::LocalTransport;
+    use std::collections::HashSet;
+
+    fn coord(
+        transport: &Arc<dyn Transport>,
+        dir: &std::path::Path,
+        cfg: &ExodusConfig,
+    ) -> Arc<ExodusCoordinator> {
+        let identity = crate::simulation::make_identity("node");
+        let store = Arc::new(ChainStore::open(&dir.join("ledger.sqlite3")).unwrap());
+        let coordinated = ExodusCoordinator::new(identity, store, transport.clone(), cfg.clone(), None);
+        coordinated.connect();
+        coordinated
+    }
+
+    #[test]
+    fn distributed_fanout_collects_peer_completions() {
+        let transport: Arc<dyn Transport> = Arc::new(LocalTransport::new());
+        let base = std::env::temp_dir().join(format!(
+            "exodus-distributed-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut cfg = crate::config::config_from_env();
+        cfg.inference = false; // peers reply with deterministic stubs, no llama needed
+        cfg.distributed_timeout_seconds = 5.0;
+
+        let mut coords = Vec::new();
+        for i in 0..3 {
+            let dir = base.join(format!("node-{i}"));
+            coords.push(coord(&transport, &dir, &cfg));
+        }
+        // Drive heartbeats so committee membership is known to everyone.
+        for _ in 0..3 {
+            for c in &coords {
+                c.consensus.tick();
+            }
+        }
+
+        let turns = vec![InferenceTurn {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let mut rx = coords[0].request_inference(
+            "req-test".into(),
+            "Llama-3.2-1B-Instruct-4bit".into(),
+            64,
+            turns,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got: Vec<InferenceResponse> = Vec::new();
+        loop {
+            while let Ok(r) = rx.try_recv() {
+                got.push(r);
+            }
+            if got.len() >= 2 || Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        coords[0].drop_inference("req-test");
+
+        assert_eq!(got.len(), 2, "expected a completion from each of the two peers");
+        let ids: HashSet<String> = got.iter().map(|r| r.node_id.clone()).collect();
+        assert_eq!(ids.len(), 2, "responses must come from distinct nodes");
+        for r in &got {
+            assert!(r.error.is_none(), "unexpected peer error: {:?}", r.error);
+            assert!(
+                r.reply.starts_with("[node:"),
+                "peer stub expected, got: {}",
+                r.reply
+            );
+        }
+
+        for c in &coords {
+            c.close();
+        }
+    }
+
+    #[test]
+    fn requester_ignores_own_echoes() {
+        let transport: Arc<dyn Transport> = Arc::new(LocalTransport::new());
+        let base = std::env::temp_dir().join(format!(
+            "exodus-distributed-echo-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut cfg = crate::config::config_from_env();
+        cfg.inference = false;
+        let solo = coord(&transport, &base, &cfg);
+        let turns = vec![InferenceTurn {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let mut rx = solo.request_inference("req-echo".into(), "m.gguf".into(), 16, turns);
+        // The published request is delivered locally too; the solo node must
+        // ignore its own echo and never receive a response for itself.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rx.try_recv().is_err());
+        solo.drop_inference("req-echo");
+        solo.close();
     }
 }

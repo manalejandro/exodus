@@ -1,7 +1,9 @@
 //! REST API for an exodus node (axum).  Mirrors the reference FastAPI router.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -389,26 +391,179 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
     if !c.config.inference {
         return stub("inference disabled (EXODUS_INFERENCE=0)");
     }
+
+    // 1. Local completion (the node that owns the chat always runs too).
     let config = c.config.clone();
     let path = model_path.clone();
-    let turns = turns.to_vec();
+    let turns_for_task = turns.to_vec();
     let gpu_for_task = gpu.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        crate::inference::complete(&config, &gpu_for_task, &path, &turns)
+    let local_started = std::time::Instant::now();
+    let local = tokio::task::spawn_blocking(move || {
+        crate::inference::complete(&config, &gpu_for_task, &path, &turns_for_task)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
-    match outcome {
-        Ok(reply) => json!({
-            "runtime": "llama.cpp",
-            "model": model,
-            "model_present": true,
-            "models": files,
-            "gpu": gpu.to_value(),
-            "reply": reply,
-        }),
-        Err(e) => stub(&format!("runtime error: {e}")),
+    let local_elapsed = local_started.elapsed().as_secs_f64();
+    let (local_reply, local_error) = match local {
+        Ok(reply) => (Some(reply), None),
+        Err(e) => (None, Some(e)),
+    };
+    if let Some(ref reply) = local_reply {
+        let prompt_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        c.record_inference_claim(model, prompt_chars, reply.chars().count(), local_elapsed);
     }
+
+    // 2. Distributed fan-out: every peer runs the same prompt and replies on
+    //    `topics::INFER_RESPONSES`; we collect until we have heard from the
+    //    expected peers or the deadline elapses.
+    let mut peers_asked = 0usize;
+    let mut peers_responded = 0usize;
+    let mut peer_replies: Vec<(String, String)> = Vec::new();
+    if c.config.distributed_inference {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let messages: Vec<crate::models::InferenceTurn> = turns
+            .iter()
+            .map(|t| crate::models::InferenceTurn {
+                role: t.role.clone(),
+                content: t.content.clone(),
+            })
+            .collect();
+        let mut rx = c.request_inference(
+            request_id.clone(),
+            model.to_string(),
+            c.config.max_tokens,
+            messages,
+        );
+        let expected = c.consensus.active_peers().len().saturating_sub(1);
+        let deadline = if expected > 0 {
+            Duration::from_secs_f64(c.config.distributed_timeout_seconds.max(1.0))
+        } else {
+            // No peers known yet: short grace window so late joiners can still
+            // answer without stalling a solo node's chat for the full timeout.
+            Duration::from_secs_f64(c.config.distributed_timeout_seconds.min(3.0))
+        };
+        let collect = async {
+            let mut seen: HashSet<String> = HashSet::new();
+            while let Some(response) = rx.recv().await {
+                if response.node_id == c.identity.node_id {
+                    continue;
+                }
+                if !seen.insert(response.node_id.clone()) {
+                    continue;
+                }
+                peers_responded += 1;
+                if response.error.is_none() {
+                    peer_replies.push((response.node_id, response.reply));
+                }
+                if expected > 0 && seen.len() >= expected {
+                    break;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(deadline, collect).await;
+        peers_asked = expected;
+        c.drop_inference(&request_id);
+    }
+
+    // 3. Aggregate across local + peer completions: the reply with the most
+    //    agreement wins (ties broken by length, then the local node).
+    let (selected, reply, agreement) = pick_agreed_reply(local_reply.as_deref(), &peer_replies);
+
+    json!({
+        "runtime": "distributed",
+        "model": model,
+        "model_present": true,
+        "models": files,
+        "gpu": gpu.to_value(),
+        "reply": reply,
+        "local_reply": local_reply,
+        "local_error": local_error,
+        "distributed": {
+            "enabled": c.config.distributed_inference,
+            "peers_asked": peers_asked,
+            "peers_responded": peers_responded,
+            "selected": selected,
+            "agreement": agreement,
+            "responses": peer_replies
+                .iter()
+                .map(|(node_id, reply)| json!({ "node_id": node_id, "reply": reply }))
+                .collect::<Vec<_>>(),
+        },
+    })
+}
+
+/// Pick the completion with the most support among the local reply and the
+/// peer replies.  Returns `(selected_node, reply, agreement_votes)`.
+fn pick_agreed_reply(local: Option<&str>, peers: &[(String, String)]) -> (String, String, usize) {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Some(l) = local {
+        if !l.trim().is_empty() {
+            candidates.push(("local".to_string(), l.to_string()));
+        }
+    }
+    for (node, reply) in peers {
+        if !reply.trim().is_empty() {
+            candidates.push((node.clone(), reply.clone()));
+        }
+    }
+    if candidates.is_empty() {
+        return (String::new(), String::new(), 0);
+    }
+    if candidates.len() == 1 {
+        let (node, reply) = candidates.pop().unwrap();
+        return (node, reply, 1);
+    }
+    let sims: Vec<Vec<f64>> = (0..candidates.len())
+        .map(|i| {
+            (0..candidates.len())
+                .map(|j| {
+                    if i == j {
+                        1.0
+                    } else {
+                        dice_similarity(&candidates[i].1, &candidates[j].1)
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let mut best = (0usize, 0usize, 0usize); // (index, votes, len)
+    for i in 0..candidates.len() {
+        let votes = 1 + (0..candidates.len())
+            .filter(|&j| j != i && sims[i][j] >= 0.5)
+            .count();
+        let len = candidates[i].1.chars().count();
+        if votes > best.1 || (votes == best.1 && len > best.2) {
+            best = (i, votes, len);
+        }
+    }
+    (candidates[best.0].0.clone(), candidates[best.0].1.clone(), best.1)
+}
+
+fn normalized_chars(s: &str) -> Vec<char> {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn bigrams(chars: &[char]) -> HashSet<(char, char)> {
+    chars.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Dice coefficient on character bigrams, `1.0` for identical text.
+fn dice_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    let ca = normalized_chars(a);
+    let cb = normalized_chars(b);
+    if ca.len() < 2 || cb.len() < 2 {
+        return if ca == cb { 1.0 } else { 0.0 };
+    }
+    let ga = bigrams(&ca);
+    let gb = bigrams(&cb);
+    let common = ga.intersection(&gb).count() as f64;
+    2.0 * common / (ga.len() as f64 + gb.len() as f64)
 }
 
 /// Resolve a model name to a file on disk; `auto` picks the first file in the
@@ -475,9 +630,8 @@ async fn dash() -> axum::response::Html<&'static str> {
 
 // ------------------------------------------------------------------- server
 
-/// Serve the node API on `host:port` until shutdown.
-pub async fn serve(c: Coord, host: String, port: u16) {
-    let app = Router::new()
+fn app(c: Coord) -> Router {
+    Router::new()
         .route("/", get(root))
         .route("/exodus/dash.html", get(dash))
         .route("/exodus/chat", post(chat))
@@ -496,14 +650,216 @@ pub async fn serve(c: Coord, host: String, port: u16) {
         .route("/exodus/models/upload", post(models_upload))
         .route("/exodus/models/:name", delete(models_delete))
         .route("/exodus/events", get(events))
-        .with_state(c);
+        .with_state(c)
+}
+
+/// Serve the node API on `host:port` until shutdown.
+pub async fn serve(c: Coord, host: String, port: u16) {
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await;
     match listener {
         Ok(l) => {
-            if let Err(e) = axum::serve(l, app).await {
+            if let Err(e) = axum::serve(l, app(c)).await {
                 eprintln!("api server error: {e}");
             }
         }
         Err(e) => eprintln!("api bind failed on {host}:{port}: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dice_similarity_matches_and_ignores_case_punct() {
+        assert!((dice_similarity("The cat sat", "The cat sat") - 1.0).abs() < 1e-9);
+        let similar = dice_similarity("Hello, world!", "hello world");
+        assert!(similar > 0.9, "similar={similar}");
+        let unrelated = dice_similarity("hello world", "quantum chromodynamics");
+        assert!(unrelated < 0.3, "unrelated={unrelated}");
+        assert_eq!(dice_similarity("a", "a"), 1.0);
+        assert_eq!(dice_similarity("a", "b"), 0.0);
+    }
+
+    #[test]
+    fn aggregation_picks_majority_then_longest_then_local() {
+        // Local disagrees; two peers agree with each other -> a peer wins.
+        let peers = vec![
+            ("b".to_string(), "the sky is blue today".to_string()),
+            ("c".to_string(), "the sky is blue today".to_string()),
+        ];
+        let (selected, reply, votes) = pick_agreed_reply(Some("completely different answer"), &peers);
+        assert_eq!(selected, "b");
+        assert_eq!(reply, "the sky is blue today");
+        assert_eq!(votes, 2);
+
+        // No agreement: tie on votes, longer reply wins.
+        let peers = vec![
+            ("b".to_string(), "short".to_string()),
+            ("c".to_string(), "a much longer different reply".to_string()),
+        ];
+        let (selected, reply, votes) = pick_agreed_reply(None, &peers);
+        assert_eq!(selected, "c");
+        assert_eq!(reply, "a much longer different reply");
+        assert_eq!(votes, 1);
+
+        // Identical local + peer -> local wins and agreement is maximal.
+        let peers = vec![("b".to_string(), "same answer here".to_string())];
+        let (selected, reply, votes) = pick_agreed_reply(Some("same answer here"), &peers);
+        assert_eq!(selected, "local");
+        assert_eq!(reply, "same answer here");
+        assert_eq!(votes, 2);
+
+        // No candidates at all.
+        let (selected, reply, votes) = pick_agreed_reply(None, &[]);
+        assert_eq!(selected, "");
+        assert_eq!(reply, "");
+        assert_eq!(votes, 0);
+    }
+
+    fn e2e_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "exodus-api-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(name);
+        std::fs::create_dir_all(&out).unwrap();
+        out
+    }
+
+    fn fake_llama(bin: &std::path::Path) {
+        std::fs::write(bin, "#!/bin/sh\nprintf 'Assistant: distributed answer\\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(bin).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(bin, perm).unwrap();
+        }
+    }
+
+    fn find_subsequence(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    async fn raw_post(addr: &str, body: Value) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let payload = serde_json::to_vec(&body).unwrap();
+        let head = format!(
+            "POST /exodus/chat HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let body_start = pos + 4;
+                let clen = header
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.to_lowercase();
+                        line.strip_prefix("content-length:")
+                            .map(|v| v.trim().to_string())
+                    })
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(buf.len() - body_start);
+                let mut body = buf[body_start..].to_vec();
+                while body.len() < clen {
+                    let n = stream.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                return String::from_utf8_lossy(&body[..clen.min(body.len())]).into_owned();
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn chat_endpoint_fans_out_to_peers() {
+        let base = e2e_dir("run");
+        let llama = base.join("llama-cli");
+        fake_llama(&llama);
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("demo-model.gguf"), "fake model bytes").unwrap();
+        let mut cfg = crate::config::config_from_env();
+        cfg.inference = true;
+        cfg.max_tokens = 32;
+        cfg.llama_bin = llama.to_string_lossy().into_owned();
+        cfg.model_dir = Some(models);
+        cfg.distributed_timeout_seconds = 5.0;
+
+        let transport: Arc<dyn crate::network::Transport> =
+            Arc::new(crate::network::LocalTransport::new());
+        let mut coords = Vec::new();
+        for i in 0..3 {
+            let identity = crate::simulation::make_identity(&format!("e2e-{i}"));
+            let store = Arc::new(
+                crate::ledger::ChainStore::open(&base.join(format!("node-{i}/ledger.sqlite3")))
+                    .unwrap(),
+            );
+            let c = ExodusCoordinator::new(identity, store, transport.clone(), cfg.clone(), None);
+            c.connect();
+            coords.push(c);
+        }
+        for _ in 0..3 {
+            for c in &coords {
+                c.consensus.tick();
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = coords[0].clone();
+        let addr = format!("127.0.0.1:{port}");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app(server)).await;
+        });
+        std::thread::sleep(Duration::from_millis(150));
+
+        let body = json!({
+            "model": "demo-model.gguf",
+            "messages": [ { "role": "user", "content": "hello" } ],
+        });
+        let response = raw_post(&addr, body).await;
+        let v: Value = serde_json::from_str(&response).unwrap_or(Value::Null);
+
+        assert_eq!(v["model_present"], json!(true), "response: {v}");
+        assert_eq!(v["runtime"], "distributed");
+        assert_eq!(v["local_reply"], "distributed answer");
+        assert_eq!(v["distributed"]["enabled"], true);
+        assert_eq!(
+            v["distributed"]["peers_responded"], 2,
+            "the two peers must have run the completion: {v}"
+        );
+        let responses = v["distributed"]["responses"].as_array().unwrap();
+        assert_eq!(responses.len(), 2);
+        let mut nodes: Vec<String> = responses
+            .iter()
+            .map(|r| r["node_id"].as_str().unwrap().to_string())
+            .collect();
+        nodes.sort();
+        nodes.dedup();
+        assert_eq!(nodes.len(), 2, "replies must come from two distinct peers: {v}");
+
+        for c in &coords {
+            c.close();
+        }
     }
 }

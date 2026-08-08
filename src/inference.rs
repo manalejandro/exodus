@@ -5,8 +5,11 @@
 //! chat turn.  Generations are stateless one-shot runs built from the
 //! conversation transcript.
 
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::ExodusConfig;
@@ -75,6 +78,31 @@ pub fn complete(
         .spawn()
         .map_err(|e| format!("failed to start {bin}: {e}"))?;
 
+    // Drain stdout and stderr on background threads while we poll the child.
+    // If the pipes are never read until the process exits, a child that fills
+    // the OS pipe buffer (~64 KB) blocks forever on write, the parent only
+    // ever sees try_wait()==None, and the chat hangs "thinking" until the
+    // timeout kills it instead of streaming a reply.
+    let out_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let err_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut drainers = Vec::new();
+    if let Some(mut out) = child.stdout.take() {
+        let buf = out_buf.clone();
+        drainers.push(thread::spawn(move || {
+            let mut tmp = Vec::new();
+            let _ = out.read_to_end(&mut tmp);
+            *buf.lock().unwrap() = tmp;
+        }));
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let buf = err_buf.clone();
+        drainers.push(thread::spawn(move || {
+            let mut tmp = Vec::new();
+            let _ = err.read_to_end(&mut tmp);
+            *buf.lock().unwrap() = tmp;
+        }));
+    }
+
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -82,10 +110,12 @@ pub fn complete(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    let output = child
-                        .wait_with_output()
-                        .map_err(|e| format!("reading output from {bin}: {e}"))?;
-                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let _ = child.wait();
+                    for d in drainers {
+                        let _ = d.join();
+                    }
+                    let guard = err_buf.lock().unwrap();
+                    let stderr = String::from_utf8_lossy(&guard);
                     let mut tail: Vec<char> = stderr.trim().chars().rev().take(300).collect();
                     tail.reverse();
                     let tail: String = tail.into_iter().collect();
@@ -105,22 +135,27 @@ pub fn complete(
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                for d in drainers {
+                    let _ = d.join();
+                }
                 return Err(format!("waiting on {bin}: {e}"));
             }
         }
     };
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("reading output from {bin}: {e}"))?;
+    for d in drainers {
+        let _ = d.join();
+    }
     if !status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let guard = err_buf.lock().unwrap();
+        let stderr = String::from_utf8_lossy(&guard);
         return Err(format!(
             "{bin} exited with {}: {}",
-            output.status,
+            status,
             stderr.trim()
         ));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let guard = out_buf.lock().unwrap();
+    let text = String::from_utf8_lossy(&guard);
     Ok(clean(&text))
 }
 
@@ -144,9 +179,97 @@ fn binary_exists(bin: &str) -> bool {
         .any(|p| p.is_file())
 }
 
+/// Parse a model's parameter count from a name like
+/// `Llama-3.2-1B-Instruct-4bit`, returning the value of the *last* `N.NB`
+/// token that is not a `…bit` precision tag (`4bit` is not 4 billion params).
+pub fn model_params_b(model: &str) -> Option<f64> {
+    let chars: Vec<char> = model.to_lowercase().chars().collect();
+    let n = chars.len();
+    let mut best: Option<f64> = None;
+    let mut i = 0;
+    while i < n {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < n && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < n && chars[i] == '.' {
+                i += 1;
+                while i < n && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            let num: String = chars[start..i].iter().collect();
+            let mut j = i;
+            while j < n && chars[j] == ' ' {
+                j += 1;
+            }
+            let is_bit = j + 2 < n && chars[j] == 'b' && chars[j + 1] == 'i' && chars[j + 2] == 't';
+            if j < n && chars[j] == 'b' && !is_bit {
+                if let Ok(v) = num.parse::<f64>() {
+                    best = Some(v);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// Pick a [`crate::models::Precision`] from a model file name (`4bit`, `8bit`,
+/// `2bit`, `int4`, …), defaulting to `fp16`.
+pub fn model_precision(model: &str) -> crate::models::Precision {
+    let s = model.to_lowercase();
+    if s.contains("2bit") || s.contains("2-bit") || s.contains("int2") {
+        crate::models::Precision::Int2
+    } else if s.contains("8bit") || s.contains("8-bit") || s.contains("int8") {
+        crate::models::Precision::Int8
+    } else if s.contains("4bit") || s.contains("4-bit") || s.contains("int4") {
+        crate::models::Precision::Int4
+    } else {
+        crate::models::Precision::Fp16
+    }
+}
+
+/// Very rough `tokens ≈ chars / 4` estimate used when the runtime cannot
+/// report exact token counts (llama-cli one-shot runs).
+pub fn estimate_tokens(chars: usize) -> i64 {
+    ((chars as f64) / 4.0).round().max(1.0) as i64
+}
+
+/// Reference FLOPS for a completion, mirroring [`crate::accounting::expected_flops`].
+pub fn estimated_flops(
+    params_b: f64,
+    precision: crate::models::Precision,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+) -> f64 {
+    2.0 * params_b * 1e9
+        * (prompt_tokens as f64 + completion_tokens as f64 * 2.0)
+        * precision.factor()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn params_b_parsing_ignores_precision_tags() {
+        assert_eq!(model_params_b("Llama-3.2-1B-Instruct-4bit"), Some(1.0));
+        assert_eq!(model_params_b("Mistral-7B-Instruct-v0.3-4bit"), Some(7.0));
+        assert_eq!(model_params_b("Qwen2.5-14B-Instruct-4bit"), Some(14.0));
+        assert_eq!(model_params_b("Mixtral-8x7B-Instruct-4bit"), Some(7.0));
+        assert_eq!(model_params_b("no model name"), None);
+    }
+
+    #[test]
+    fn precision_parses_from_name() {
+        assert_eq!(model_precision("x-4bit"), crate::models::Precision::Int4);
+        assert_eq!(model_precision("x-8bit"), crate::models::Precision::Int8);
+        assert_eq!(model_precision("x-2bit"), crate::models::Precision::Int2);
+        assert_eq!(model_precision("plain"), crate::models::Precision::Fp16);
+    }
 
     #[test]
     fn prompt_builds_transcript() {

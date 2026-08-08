@@ -8,6 +8,13 @@ pub const HEARTBEATS: &str = "exodus/heartbeats";
 pub const SYNC: &str = "exodus/sync";
 pub const FORKS: &str = "exodus/forks";
 
+/// Distributed inference fan-out (request/response), handled outside the
+/// consensus loop so peers can run a completion without entering the
+/// blockchain protocol.  Deliberately *not* part of [`ALL_TOPICS`]; the
+/// coordinator subscribes to them separately.
+pub const INFER_REQUESTS: &str = "exodus/infer/requests";
+pub const INFER_RESPONSES: &str = "exodus/infer/responses";
+
 pub const ALL_TOPICS: [&str; 7] = [
     CLAIMS,
     PROPOSALS,
