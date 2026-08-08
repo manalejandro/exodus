@@ -6,7 +6,8 @@
 //! conversation transcript.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::ExodusConfig;
 use crate::gpu::GpuInfo;
@@ -67,10 +68,40 @@ pub fn complete(
     cmd.arg("--temp").arg("0.6");
     cmd.arg("--no-display-prompt");
 
-    let output = cmd
-        .output()
+    let timeout = Duration::from_secs_f64(config.inference_timeout_seconds.max(1.0));
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("failed to start {bin}: {e}"))?;
-    if !output.status.success() {
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "inference timed out after {}s and was killed ({bin}, model {})",
+                        config.inference_timeout_seconds,
+                        model_path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting on {bin}: {e}"));
+            }
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("reading output from {bin}: {e}"))?;
+    if !status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "{bin} exited with {}: {}",
@@ -145,5 +176,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not found"), "unexpected: {err}");
+    }
+
+    fn scratch(name: &str, body: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "exodus-infer-test-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&path, perm).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn timed_out_inference_is_killed() {
+        let bin = scratch("slow.sh", "#!/bin/sh\nsleep 5\n");
+        let model = scratch("model.gguf", "fake model bytes");
+        let cfg = ExodusConfig {
+            llama_bin: bin.to_string_lossy().into_owned(),
+            inference_timeout_seconds: 1.0,
+            ..crate::config::config_from_env()
+        };
+        let err = complete(&cfg, &GpuInfo::default(), &model, &[]).unwrap_err();
+        assert!(err.contains("timed out"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn quick_inference_succeeds() {
+        let bin = scratch("fast.sh", "#!/bin/sh\nprintf 'Assistant: hello there\\n'\n");
+        let model = scratch("model2.gguf", "bytes");
+        let cfg = ExodusConfig {
+            llama_bin: bin.to_string_lossy().into_owned(),
+            inference_timeout_seconds: 5.0,
+            ..crate::config::config_from_env()
+        };
+        let out = complete(&cfg, &GpuInfo::default(), &model, &[]).unwrap();
+        assert_eq!(out, "hello there");
     }
 }

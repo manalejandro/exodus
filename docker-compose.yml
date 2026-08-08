@@ -52,6 +52,7 @@ services:
       # EXODUS_LLAMA_BIN: "/opt/llama.cpp/llama-cli"  # override inference binary
       # EXODUS_INFERENCE: "true"             # 0 -> chat returns the state stub
       # EXODUS_MAX_TOKENS: "256"             # max generated tokens per reply
+      # EXODUS_INFERENCE_TIMEOUT_SECONDS: "120"  # kill llama-cli if it hangs past this
 
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:52515/exodus/healthz || exit 1"]

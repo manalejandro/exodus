@@ -173,6 +173,7 @@ All settings are read from environment variables prefixed with `EXODUS_`:
 | `EXODUS_LLAMA_BIN` | `llama-cli` | llama.cpp CLI binary used for inference (`POST /exodus/chat`) |
 | `EXODUS_INFERENCE` | `true` | Enable chat inference; `0` returns the state stub |
 | `EXODUS_MAX_TOKENS` | `256` | Max generated tokens per chat reply |
+| `EXODUS_INFERENCE_TIMEOUT_SECONDS` | `120` | Kill llama-cli if a completion hangs past this |
 | `EXODUS_NODE_NAME` | `exodus-node` | Human-readable node name |
 | `EXODUS_NODE_HOST` | `0.0.0.0` | Gossip listen address |
 | `EXODUS_NODE_PORT` | `52514` | Gossip TCP port |
