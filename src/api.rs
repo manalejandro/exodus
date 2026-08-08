@@ -440,26 +440,20 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
         return stub("inference disabled (EXODUS_INFERENCE=0)");
     }
 
-    // 1. Local completion (the node that owns the chat always runs too).
+    // 1. Start the local completion in the background while we fan out to
+    //    peers, so the local llama-cli and the remote ones run concurrently
+    //    instead of one blocking the other.  If we awaited the local run first,
+    //    the peers only start after the local llama-cli finishes — usually too
+    //    late to fit inside the distributed deadline, so their replies never
+    //    get collected.
     let config = c.config.clone();
     let path = model_path.clone();
     let turns_for_task = turns.to_vec();
     let gpu_for_task = gpu.clone();
     let local_started = std::time::Instant::now();
-    let local = tokio::task::spawn_blocking(move || {
+    let local_task = tokio::task::spawn_blocking(move || {
         crate::inference::complete(&config, &gpu_for_task, &path, &turns_for_task)
-    })
-    .await
-    .unwrap_or_else(|e| Err(e.to_string()));
-    let local_elapsed = local_started.elapsed().as_secs_f64();
-    let (local_reply, local_error) = match local {
-        Ok(reply) => (Some(reply), None),
-        Err(e) => (None, Some(e)),
-    };
-    if let Some(ref reply) = local_reply {
-        let prompt_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        c.record_inference_claim(model, prompt_chars, reply.chars().count(), local_elapsed);
-    }
+    });
 
     // 2. Distributed fan-out: every peer runs the same prompt and replies on
     //    `topics::INFER_RESPONSES`; we collect until we have heard from the
@@ -528,7 +522,21 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
         c.drop_inference(&request_id);
     }
 
-    // 3. Aggregate across local + peer completions: the reply with the most
+    // 3. Join the local completion started in step 1.
+    let local_elapsed = local_started.elapsed().as_secs_f64();
+    let local = local_task
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+    let (local_reply, local_error) = match local {
+        Ok(reply) => (Some(reply), None),
+        Err(e) => (None, Some(e)),
+    };
+    if let Some(ref reply) = local_reply {
+        let prompt_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        c.record_inference_claim(model, prompt_chars, reply.chars().count(), local_elapsed);
+    }
+
+    // 4. Aggregate across local + peer completions: the reply with the most
     //    agreement wins (ties broken by length, then the local node).
     let (selected, reply, agreement) = pick_agreed_reply(local_reply.as_deref(), &peer_replies);
 
