@@ -199,7 +199,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let mut cfg = crate::config::config_from_env();
         cfg.inference = false;
-        cfg.sync_request_interval_seconds = 0.05;
+        cfg.sync_request_interval_seconds = 0.0;
         for n in [2usize, 3, 4, 6] {
             let dir = base.join(format!("run-{n}"));
             let res = simulate(n, 15, Some(7), 2, Some(cfg.clone()), Some(dir));

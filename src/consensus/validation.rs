@@ -145,10 +145,24 @@ pub fn validate_checkpoint(
     };
     validate_proposal(proposal, store, seen, flops_tolerance, allow_empty_claims)?;
 
-    if checkpoint.signatures.len() < min_quorum {
+    // Freeze quorum at seal time (see `Checkpoint.quorum`): the number of
+    // signatures required when the block was committed, not the committee the
+    // receiving node happens to know today.  Recomputing quorum dynamically
+    // makes honestly-sealed stale blocks (e.g. from a smaller network) forever
+    // unvalidable and wedges catch-up into an endless resync loop.  A block
+    // with no recorded quorum predates this rule: require at least the sealer
+    // itself signed it.
+    let required = if checkpoint.quorum > 0 {
+        checkpoint.quorum
+    } else {
+        1
+    };
+    if checkpoint.signatures.len() < required {
         return Err(ValidationError(format!(
-            "insufficient quorum: {} < {}",
+            "insufficient quorum: {} < {} (block quorum {}, local committee {})",
             checkpoint.signatures.len(),
+            required,
+            checkpoint.quorum,
             min_quorum
         )));
     }

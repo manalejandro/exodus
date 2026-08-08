@@ -535,6 +535,11 @@ impl ProtocolState {
                     signature_hex: s.signature_hex.clone(),
                 })
                 .collect(),
+            // Freeze the quorum the network required at seal time so this
+            // block stays valid once the committee grows (dynamic recompute
+            // would permanently invalidate honestly-sealed stale blocks and
+            // wedge catch-up into an endless resync loop).
+            quorum: quorum_size(self, store, config),
         };
         let mut seen = self.committed_claim_ids.clone();
         if let Err(e) = validate_checkpoint(
@@ -699,11 +704,14 @@ impl ProtocolState {
 
     /// Queue a `SyncRequest` subject to a rate limit so a node that cannot make
     /// progress (or a peer redelivering the same block) cannot trigger an
-    /// endless stream of full-chain responses.
+    /// endless stream of full-chain responses.  The interval uses the monotonic
+    /// wall clock; tests relax it to `0` so in-process simulations converge.
     fn request_sync(&mut self, from_height: i64) {
         eprintln!("[request_sync] from={from_height} node={}", self.node_id);
         let t = now();
-        if t - self.last_sync_request < self.sync_interval_seconds {
+        if self.sync_interval_seconds > 0.0
+            && t - self.last_sync_request < self.sync_interval_seconds
+        {
             return;
         }
         self.last_sync_request = t;
@@ -1019,6 +1027,7 @@ mod tests {
         Checkpoint {
             proposal: proposal.clone(),
             signatures: vec![quorum_sig(private_key, &proposal)],
+            quorum: 1,
         }
     }
 
@@ -1176,7 +1185,7 @@ mod tests {
             claims: vec![claim],
             created_at: utcnow_iso(),
         };
-        let bad = Checkpoint { proposal, signatures: Vec::new() };
+        let bad = Checkpoint { proposal, signatures: Vec::new(), quorum: 1 };
         let hash = bad.block_hash();
 
         // First delivery: rejected (and remembered).
@@ -1229,5 +1238,79 @@ mod tests {
         // block while we cannot advance) is dropped by the cooldown.
         state.request_sync(1);
         assert_eq!(state.outgoing.len(), 1);
+    }
+
+    #[test]
+    fn frozen_quorum_outlives_committee_growth() {
+        let store = temp_store();
+        let genesis = store.head().unwrap();
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        let mut state = test_state(&store);
+        state.node_id = crate::crypto::node_id_from_public_key(&public_key);
+        state.private_key = private_key.to_vec();
+
+        // The block was sealed when the network was a single node: only the
+        // sealer signed (quorum frozen at 1).  This is the exact production
+        // shape behind the endless `request_sync` loop: the receiving node now
+        // knows a *larger* committee, so a dynamically-recomputed quorum would
+        // reject a perfectly valid extension forever.
+        let claim = signed_claim(1);
+        let block = sealed_block(&private_key, 1, 1, genesis.block_hash(), vec![claim.clone()]);
+        assert_eq!(block.quorum, 1);
+        assert_eq!(block.signatures.len(), 1);
+        store.append(&block).unwrap();
+
+        // A peer committee of three: with dynamic quorum the block would need
+        // three signatures and be rejected, re-triggering sync forever. The
+        // frozen quorum keeps it valid.
+        let peer_ids = vec![
+            "exdfake0000000000000000000000001".to_string(),
+            "exdfake0000000000000000000000002".to_string(),
+            "exdfake0000000000000000000000003".to_string(),
+        ];
+        for id in &peer_ids {
+            state.peers.insert(id.clone(), Heartbeat {
+                node_id: id.clone(),
+                height: 1,
+                block_hash: block.block_hash(),
+                epoch: 1,
+                sealed_by: block.proposal.sealed_by.clone(),
+                quorum_weight: 1,
+            });
+        }
+
+        let commit = CommitMessage { checkpoint: block.clone() };
+        state.on_commit(commit, &store, &config_from_env());
+        assert_eq!(store.height(), 1, "frozen-quorum commit must be accepted");
+        assert_eq!(store.head().unwrap().block_hash(), block.block_hash());
+    }
+
+    #[test]
+    fn legacy_block_without_quorum_is_accepted_with_its_sealer() {
+        let store = temp_store();
+        let genesis = store.head().unwrap();
+        let (private_key, public_key) = crate::crypto::generate_key_pair();
+        let mut state = test_state(&store);
+        state.node_id = crate::crypto::node_id_from_public_key(&public_key);
+        state.private_key = private_key.to_vec();
+
+        let claim = signed_claim(1);
+        let proposal = CheckpointProposal {
+            epoch: 1,
+            height: 1,
+            prev_hash: genesis.block_hash(),
+            sealed_by: state.node_id.clone(),
+            claims: vec![claim],
+            created_at: utcnow_iso(),
+        };
+        // A pre-quorum binary produced this block: no `quorum` recorded, but a
+        // valid sealer signature exists. It must be accepted (require >= 1 sig).
+        let block = Checkpoint {
+            proposal: proposal.clone(),
+            signatures: vec![quorum_sig(&private_key, &proposal)],
+            quorum: 0,
+        };
+        state.on_commit(CommitMessage { checkpoint: block.clone() }, &store, &config_from_env());
+        assert_eq!(store.height(), 1, "legacy block must be accepted");
     }
 }

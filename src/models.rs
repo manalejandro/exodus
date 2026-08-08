@@ -239,6 +239,12 @@ pub struct Checkpoint {
     pub proposal: CheckpointProposal,
     #[serde(default)]
     pub signatures: Vec<QuorumSignature>,
+    /// Number of signatures the network required when this block was sealed.
+    /// Frozen at commit time so a block accepted by a small committee stays
+    /// valid once the peer set grows (otherwise the dynamic quorum would make
+    /// stale-but-honest blocks permanently unvalidable and cause endless sync).
+    #[serde(default)]
+    pub quorum: usize,
 }
 
 impl Checkpoint {
@@ -425,6 +431,7 @@ pub fn genesis_checkpoint() -> Checkpoint {
             created_at: GENESIS_TIMESTAMP.to_string(),
         },
         signatures: Vec::new(),
+        quorum: 0,
     }
 }
 

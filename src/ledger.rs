@@ -80,6 +80,18 @@ impl ChainStore {
              CREATE INDEX IF NOT EXISTS idx_blocks_height ON blocks(height);",
         )
         .map_err(|e| LedgerError(e.to_string()))?;
+        // Migrate older ledgers that pre-date the frozen `quorum` column.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(blocks)")
+            .map_err(|e| LedgerError(e.to_string()))?
+            .query_map([], |r| r.get::<_, String>(1))
+            .map_err(|e| LedgerError(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect();
+        if !cols.iter().any(|c| c == "quorum") {
+            conn.execute("ALTER TABLE blocks ADD COLUMN quorum INTEGER NOT NULL DEFAULT 0", [])
+                .map_err(|e| LedgerError(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -173,8 +185,8 @@ impl ChainStore {
             .unchecked_transaction()
             .map_err(|e| LedgerError(e.to_string()))?;
         tx.execute(
-            "INSERT INTO blocks (height, block_hash, prev_hash, epoch, sealed_by, proposal_json, signatures_json, committed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO blocks (height, block_hash, prev_hash, epoch, sealed_by, proposal_json, signatures_json, quorum, committed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 checkpoint.height(),
                 checkpoint.block_hash(),
@@ -183,6 +195,7 @@ impl ChainStore {
                 checkpoint.proposal.sealed_by,
                 prop_json,
                 sig_json,
+                checkpoint.quorum as i64,
                 checkpoint.proposal.created_at
             ],
         )
@@ -366,15 +379,15 @@ impl ChainStore {
         for h in 0..=height {
             let row = conn
                 .query_row(
-                    "SELECT * FROM blocks WHERE height = ?1",
+                    "SELECT block_hash, prev_hash, proposal_json, signatures_json, quorum FROM blocks WHERE height = ?1",
                     params![h],
-                    |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(5)?, r.get::<_, String>(6)?)),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?)),
                 )
                 .ok();
-            let Some((stored_hash, stored_prev, prop_json, sig_json)) = row else {
+            let Some((stored_hash, stored_prev, prop_json, sig_json, quorum)) = row else {
                 return (false, format!("missing block {h}"));
             };
-            let checkpoint = reconstruct(prop_json, sig_json);
+            let checkpoint = reconstruct(prop_json, sig_json, quorum);
             if stored_prev != prev_hash {
                 return (false, format!("broken link at block {h}"));
             }
@@ -396,11 +409,12 @@ impl ChainStore {
     }
 }
 
-fn reconstruct(proposal_json: String, signatures_json: String) -> Checkpoint {
+fn reconstruct(proposal_json: String, signatures_json: String, quorum: i64) -> Checkpoint {
     use crate::models::Checkpoint;
-    serde_json::from_value(json!({
+    let mut checkpoint: Checkpoint = serde_json::from_value(json!({
         "proposal": serde_json::from_str::<Value>(&proposal_json).unwrap_or(Value::Null),
         "signatures": serde_json::from_str::<Value>(&signatures_json).unwrap_or(Value::Null),
+        "quorum": quorum.max(0),
     }))
     .unwrap_or_else(|_| {
         // fall back to genesis (should not happen for a well-formed ledger)
@@ -414,8 +428,16 @@ fn reconstruct(proposal_json: String, signatures_json: String) -> Checkpoint {
                 created_at: String::new(),
             },
             signatures: vec![],
+            quorum: 0,
         }
-    })
+    });
+    // Blocks committed by an older build have no frozen quorum; treat the
+    // signatures they already carry as the quorum they were sealed with so
+    // they stay valid instead of failing against a larger, newer committee.
+    if checkpoint.quorum == 0 && !checkpoint.signatures.is_empty() {
+        checkpoint.quorum = checkpoint.signatures.len();
+    }
+    checkpoint
 }
 
 fn head_locked(conn: &Connection) -> Option<i64> {
@@ -436,14 +458,20 @@ fn block_hash_locked(conn: &Connection, height: i64) -> Option<String> {
 }
 
 fn block_locked(conn: &Connection, height: i64) -> Option<crate::models::Checkpoint> {
-    let (prop, sig) = conn
+    let (prop, sig, quorum) = conn
         .query_row(
-            "SELECT proposal_json, signatures_json FROM blocks WHERE height = ?1",
+            "SELECT proposal_json, signatures_json, quorum FROM blocks WHERE height = ?1",
             params![height],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
         )
         .ok()?;
-    Some(reconstruct(prop, sig))
+    Some(reconstruct(prop, sig, quorum))
 }
 
 #[cfg(test)]
@@ -499,6 +527,7 @@ mod tests {
                 created_at: crate::models::utcnow_iso(),
             },
             signatures: Vec::new(),
+            quorum: 1,
         }
     }
 
