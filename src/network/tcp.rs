@@ -413,8 +413,9 @@ fn discovery_loop(inner: Arc<Inner>, group: String, port: u16) {
                 let host = v
                     .get("host")
                     .and_then(|x| x.as_str())
-                    .unwrap_or(&src.ip().to_string())
-                    .to_string();
+                    .filter(|h| !h.is_empty() && *h != "0.0.0.0" && *h != "::")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| src.ip().to_string());
                 let p = v.get("port").and_then(|x| x.as_u64()).unwrap_or(52514);
                 let addr = format!("{host}:{p}");
                 // Only keep one connection loop per address: discovery announces

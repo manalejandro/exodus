@@ -14,9 +14,12 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::Stream as TokioStream;
 use tokio_stream::StreamExt;
 
 use crate::coordinator::ExodusCoordinator;
@@ -324,10 +327,36 @@ fn safe_model_name(name: &str) -> bool {
         && !name.contains('\\')
 }
 
+/// Wraps an SSE stream and removes a coordinator commit-hook by name when the
+/// stream is dropped (i.e. when the SSE client disconnects), so repeated
+/// dashboard polls do not leak one handler per connection.
+struct HookCleanup<S> {
+    inner: S,
+    coordinator: Coord,
+    hook_name: String,
+    armed: bool,
+}
+
+impl<S: TokioStream + Unpin> TokioStream for HookCleanup<S> {
+    type Item = S::Item;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for HookCleanup<S> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.coordinator.remove_commit_hook(&self.hook_name);
+        }
+    }
+}
+
 async fn events(State(c): State<Coord>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let (tx, _rx) = broadcast::channel::<(i64, String)>(64);
     let tx2 = tx.clone();
-    c.add_commit_hook("sse", Box::new(move |height, hash| {
+    let hook_name = format!("sse-{}", uuid::Uuid::new_v4().simple());
+    c.add_commit_hook(&hook_name, Box::new(move |height, hash| {
         let _ = tx2.send((height, hash));
     }));
     let hello = Event::default().data(
@@ -339,14 +368,22 @@ async fn events(State(c): State<Coord>) -> Sse<impl tokio_stream::Stream<Item = 
         })
         .to_string(),
     );
-    let stream = tokio_stream::once(Ok(hello))
+    let inner = tokio_stream::once(Ok(hello))
         .chain(BroadcastStream::new(tx.subscribe()).map(|item| {
             let (height, hash) = item.unwrap_or((0, String::new()));
             Ok(Event::default().data(
                 json!({ "height": height, "block_hash": hash }).to_string(),
             ))
         }));
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // Remove the hook when the connection drops so SSE polls do not leak
+    // handlers (each one held a broadcast::Sender forever).
+    Sse::new(HookCleanup {
+        inner,
+        coordinator: c.clone(),
+        hook_name,
+        armed: true,
+    })
+    .keep_alive(KeepAlive::default())
 }
 
 /// Chat with the distributed model.  When a llama.cpp runtime is available

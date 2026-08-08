@@ -42,6 +42,9 @@ pub struct ExodusCoordinator {
     /// Live fan-out requests: `request_id → channel` where peer completions are
     /// delivered as they arrive on `topics::INFER_RESPONSES`.
     infer_tx: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<InferenceResponse>>>,
+    /// Bounds how many remote completions run at once so a flood of fan-out
+    /// requests cannot spawn unbounded llama-cli processes.
+    infer_slots: tokio::sync::Semaphore,
 }
 
 /// Decode a raw JSON payload into a typed protocol message for a topic.
@@ -112,6 +115,7 @@ impl ExodusCoordinator {
             config.clone(),
             Some(listener),
         );
+        let infer_slots = tokio::sync::Semaphore::new(config.max_concurrent_inference.max(1));
         Arc::new(ExodusCoordinator {
             identity,
             store,
@@ -124,6 +128,7 @@ impl ExodusCoordinator {
             commit_hooks,
             gpu_cache: Mutex::new(None),
             infer_tx: Mutex::new(HashMap::new()),
+            infer_slots,
         })
     }
 
@@ -191,6 +196,16 @@ impl ExodusCoordinator {
             name: name.to_string(),
             handler,
         });
+    }
+
+    /// Remove a previously-registered commit hook by name (best-effort: removes
+    /// the first hook with a matching name).  SSE connections use this to drop
+    /// their hook on disconnect so repeated dashboard polls do not accumulate.
+    pub fn remove_commit_hook(&self, name: &str) {
+        let mut hooks = self.commit_hooks.lock().unwrap();
+        if let Some(pos) = hooks.iter().position(|h| h.name == name) {
+            hooks.remove(pos);
+        }
     }
 
     /// Detected GPU state for this node (detection runs once and is cached).
@@ -334,6 +349,28 @@ impl ExodusCoordinator {
             "[infer] node={} running {} for {}",
             self.identity.node_id, request.request_id, request.origin
         );
+        // Bound concurrent remote completions; when all slots are busy reply
+        // with an explicit error instead of queueing unbounded llama-cli spawns.
+        // The permit is held for the whole completion so a busy slot is not
+        // released until the llama-cli process has returned.
+        let _slot = match self.infer_slots.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                eprintln!(
+                    "[infer] node={} overloaded, rejecting {} for {}",
+                    self.identity.node_id, request.request_id, request.origin
+                );
+                let response = InferenceResponse {
+                    request_id: request.request_id.clone(),
+                    node_id: self.identity.node_id.clone(),
+                    reply: String::new(),
+                    error: Some("node busy: too many concurrent inferences".into()),
+                };
+                let payload = serde_json::to_value(&response).unwrap_or_default();
+                let _ = self.transport.publish(topics::INFER_RESPONSES, &payload);
+                return;
+            }
+        };
         let started = Instant::now();
         let result = self.complete_for_request(request);
         let elapsed = started.elapsed().as_secs_f64();

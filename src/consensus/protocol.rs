@@ -60,6 +60,13 @@ struct ProtocolState {
 /// (and re-validated) on every redelivery, forever.
 const MAX_RECENT_COMMIT_REJECTS: usize = 512;
 
+/// Bounded cap for the in-memory claim queue fed by the network.
+const MAX_PENDING_CLAIMS: usize = 4096;
+
+/// Bounded cap for out-of-order commits waiting to be applied once a gap is
+/// filled by a sync response; the network can otherwise push arbitrary heights.
+const MAX_PENDING_COMMITS: usize = 1024;
+
 pub struct ConsensusProtocol {
     pub node_id: String,
     store: Arc<ChainStore>,
@@ -466,6 +473,16 @@ impl ProtocolState {
             return;
         }
         self.pending.insert(signed.claim.claim_id.clone(), signed);
+        // Bound the in-memory claim queue: it is fed by the network, so an
+        // adversarial peer can otherwise grow it without limit.
+        while self.pending.len() > MAX_PENDING_CLAIMS {
+            let oldest = self.pending.iter().next().map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                self.pending.remove(&id);
+            } else {
+                break;
+            }
+        }
     }
 
     fn on_proposal(&mut self, pm: ProposalMessage, store: &ChainStore, config: &ExodusConfig) {
@@ -568,10 +585,16 @@ impl ProtocolState {
                 // Re-delivery or fork twin of an already-committed block:
                 // reconcile local state so we stop re-attempting the append
                 // and stop spamming SyncRequests for a block we already have.
+                // Only the claims actually present in the ledger are treated as
+                // committed: a fork twin carries claims that were never
+                // appended locally, and marking those as committed would
+                // permanently exclude them from the canonical branch.
                 for signed in &checkpoint.proposal.claims {
                     self.pending.remove(&signed.claim.claim_id);
                     self.proposed_claim_ids.remove(&signed.claim.claim_id);
-                    self.committed_claim_ids.insert(signed.claim.claim_id.clone());
+                    if store.claim_exists(&signed.claim.claim_id) {
+                        self.committed_claim_ids.insert(signed.claim.claim_id.clone());
+                    }
                 }
                 return;
             }
@@ -635,12 +658,12 @@ impl ProtocolState {
         }
         let head_height = head.as_ref().map(|h| h.height()).unwrap_or(-1);
         if head.is_none() && checkpoint.height() != 0 {
-            self.pending_commits.insert(checkpoint.height(), checkpoint);
+            self.insert_pending_commit(checkpoint);
             self.request_sync(-1);
             return;
         }
         if checkpoint.height() > head_height + 1 {
-            self.pending_commits.insert(checkpoint.height(), checkpoint);
+            self.insert_pending_commit(checkpoint);
             self.request_sync(head_height);
             return;
         }
@@ -751,6 +774,21 @@ impl ProtocolState {
         }
     }
 
+    /// Store an out-of-order commit for later application once the gap is
+    /// filled.  The queue is fed by the network, so it is bounded: when full,
+    /// the lowest-height entry is dropped rather than growing without limit.
+    fn insert_pending_commit(&mut self, checkpoint: Checkpoint) {
+        self.pending_commits.insert(checkpoint.height(), checkpoint);
+        while self.pending_commits.len() > MAX_PENDING_COMMITS {
+            let lowest = self.pending_commits.keys().next().cloned();
+            if let Some(h) = lowest {
+                self.pending_commits.remove(&h);
+            } else {
+                break;
+            }
+        }
+    }
+
     fn on_heartbeat(&mut self, hb: Heartbeat, store: &ChainStore) {
         if hb.node_id == self.node_id {
             return;
@@ -855,6 +893,51 @@ impl ProtocolState {
         }
         let local_height = store.height();
         let ancestor = common_ancestor(store, &blocks);
+
+        // Validate the *entire* incoming chain before touching the local ledger.
+        // A reorg used to roll back first and validate as it went, which left
+        // the local chain truncated if a gap or an invalid block was found
+        // halfway.  The incoming blocks must form a contiguous extension of the
+        // ancestor (each block chains off the previous one) and every height
+        // must advance by exactly one.
+        let incoming: Vec<&Checkpoint> = blocks
+            .iter()
+            .filter(|b| b.height() > ancestor)
+            .collect();
+        let mut expected_prev = store
+            .get_block(ancestor)
+            .map(|b| b.block_hash())
+            .unwrap_or_else(|| crate::models::GENESIS_PREV_HASH.to_string());
+        let mut expected_height = ancestor + 1;
+        for block in &incoming {
+            if block.height() != expected_height {
+                eprintln!(
+                    "reorg rejecting chain: height {} not contiguous after {}",
+                    block.height(),
+                    expected_height - 1
+                );
+                return;
+            }
+            if block.proposal.prev_hash != expected_prev {
+                eprintln!(
+                    "reorg rejecting chain: {} does not chain off {}",
+                    block.height(),
+                    expected_prev
+                );
+                return;
+            }
+            expected_prev = block.block_hash();
+            expected_height += 1;
+        }
+
+        // Everything validates: snapshot the local blocks above the ancestor so
+        // we can restore them if the re-apply fails partway.
+        let mut saved: Vec<Checkpoint> = Vec::new();
+        for h in (ancestor + 1)..=local_height {
+            if let Some(b) = store.get_block(h) {
+                saved.push(b);
+            }
+        }
         if ancestor < local_height {
             if let Err(e) = store.rollback(ancestor) {
                 eprintln!("reorg rollback failed: {e}");
@@ -867,11 +950,8 @@ impl ProtocolState {
             // Blocks above the ancestor are being replaced.
             self.pending_commits.retain(|&h, _| h <= store.height());
         }
-        for block in blocks.iter().filter(|b| b.height() > ancestor) {
-            if block.height() != store.height() + 1 {
-                eprintln!("reorg gap at height {}", block.height());
-                return;
-            }
+        let mut applied = 0usize;
+        for block in &incoming {
             let mut seen_here = HashSet::new();
             if let Err(e) = validate_checkpoint(
                 block,
@@ -881,10 +961,25 @@ impl ProtocolState {
                 false,
                 Some(&mut seen_here),
             ) {
-                eprintln!("reorg rejecting block {}: {e}", block.height());
+                eprintln!("reorg rejecting block {} mid-apply: {e}", block.height());
+                // Restore the blocks we deleted so a failed reorg never leaves
+                // the local chain shorter than before.
+                for b in saved.iter().take(applied) {
+                    if store.get_block(b.height()).is_none() {
+                        let _ = store.append(b);
+                    }
+                }
+                let _ = store.rollback(ancestor);
+                for b in &saved {
+                    if store.get_block(b.height()).is_none() {
+                        let _ = store.append(b);
+                    }
+                }
+                self.committed_claim_ids = store.all_committed_claim_ids();
                 return;
             }
             self.commit_local(block, store);
+            applied += 1;
         }
         // The committed set may have changed (old claims rolled back, new ones
         // adopted); rebuild it from the store to stay consistent.

@@ -2,15 +2,16 @@
 
 **Free, non-profit, open distributed compute network.**
 
-exodus is a distributed compute network where nodes contribute inference
-compute, submit verifiable contribution claims, earn credits for their work,
-and maintain a single tamper-evident ledger through Byzantine-fault-tolerant
-consensus.
+exodus is a peer-to-peer network where nodes contribute inference compute,
+submit verifiable contribution claims, earn credits for their work, and reach
+consensus on a single tamper-evident ledger using a Byzantine-fault-tolerant
+(BFT) protocol. Inference requests fan out across the network, so a single
+node is never the bottleneck — the network *is* the model.
 
-This repository contains the reference node implementation in **Rust**, a
-faithful port of the original Python prototype. It ships as a single `exodus`
-binary with a REST API, a web dashboard, GPU detection, and a deterministic
-simulation mode.
+This repository is the reference node implementation in **Rust**, a faithful
+port of the original Python prototype. It ships as a single `exodus` binary
+with a REST API, a self-contained web dashboard, GPU detection, distributed
+inference, and a deterministic simulation mode.
 
 ## Features
 
@@ -21,13 +22,22 @@ simulation mode.
   block is cryptographically chained: `block_hash = sha256(proposal_hash +
   canonical_json(signatures))`.
 - **BFT consensus** — view-based sealer rotation, proposals, signature shares
-  and commit messages with a `2f+1` Byzantine quorum or simple majority mode.
+  and commit messages with a `2f+1` Byzantine quorum (or simple-majority mode).
+  The quorum is frozen at sealing time so membership changes never weaken a
+  committed block.
+- **Reorg & reconciliation** — chains diverge and converge: a shorter peer
+  chain is rolled back and re-validated against the longest winning fork, with
+  rollback protection for the local ledger.
 - **Credits & rewards** — compute-unit accounting, a diminishing reward curve,
   credit half-life decay, priority tiers and fair scheduling quotas.
+- **Distributed inference** — `POST /exodus/chat` fans the request out to
+  network peers, aggregates their completions, and records a verifiable
+  contribution claim on the ledger.
 - **Networking** — length-prefixed JSON frames over TCP gossip with
-  message-id dedup and forwarding, plus UDP multicast peer discovery.
-- **REST API + SSE + dashboard** — axum-based API, a live event stream, and a
-  self-contained single-file web dashboard (no external dependencies).
+  message-id dedup and forwarding, plus UDP multicast peer discovery and an
+  in-process transport for simulation.
+- **REST API + SSE + dashboard** — axum-based API, a live event stream, and
+  single-file HTML web apps (chat and dashboard) with no external dependencies.
 - **GPU support** — automatic NVIDIA GPU detection (`nvidia-smi`, container
   hints, `EXODUS_GPU_LAYERS`) reported through the API and used to tag
   contributions with the correct device tier.
@@ -41,17 +51,23 @@ simulation mode.
 | Path | Purpose |
 | --- | --- |
 | `src/identity.rs` | Ed25519 identity, node-id derivation, key management |
-| `src/ledger.rs` | SQLite chain store, block hashing, chain verification |
-| `src/consensus/` | BFT consensus protocol, claim/proposal validation, topics |
+| `src/ledger.rs` | SQLite chain store, block hashing, verification, rollback |
+| `src/crypto.rs` | Hash + signature primitives over canonical JSON |
+| `src/consensus/` | BFT protocol, claim/proposal validation, message topics |
+| `src/coordinator.rs` | Node runtime: wires network, consensus, ledger and API |
 | `src/accounting.rs` | FLOPS plausibility checks, compute-unit calculation |
 | `src/rewards.rs` | Credits, reward curve, decay, priority tiers, network report |
+| `src/inference.rs` | llama.cpp backend + distributed fan-out aggregation |
 | `src/network/` | `Transport` trait, TCP gossip, UDP discovery, in-process transport |
 | `src/api.rs` | axum REST API + SSE event stream |
 | `src/static/index.html` | Single-file web chat (served at `/`) |
 | `src/static/dash.html` | Single-file web dashboard (served at `/exodus/dash.html`) |
 | `src/gpu.rs` | GPU detection and capability reporting |
+| `src/models.rs` | Model-file listing, upload and deletion |
 | `src/simulation.rs` | Headless multi-node simulation harness |
 | `src/config.rs` | `EXODUS_*` environment-based configuration |
+
+See [DESIGN.md](DESIGN.md) for the full protocol and ledger design.
 
 ## Quick start
 
@@ -130,10 +146,13 @@ dashboard at `/exodus/dash.html` (both single-file HTML, no external deps).
 ] }
 ```
 
-`model` is optional (`"auto"` picks the first file in `EXODUS_MODEL_DIR`). When a
-llama.cpp runtime is available (`EXODUS_LLAMA_BIN`, default `llama-cli`) and the
-model file is present, the node runs a real completion and returns
-`{"runtime": "llama.cpp", "reply": "…"}`. Otherwise it returns a truthful stub
+`model` is optional (`"auto"` picks the first file in `EXODUS_MODEL_DIR`). When
+distributed inference is enabled (default), the request is fanned out to active
+network peers on the `exodus/infer/requests` topic, their completions are
+aggregated, and a verifiable contribution claim is recorded on the ledger
+(`"runtime": "distributed"`). When a llama.cpp runtime is available
+(`EXODUS_LLAMA_BIN`, default `llama-cli`) and the model file is present, the
+node also runs a real local completion. Otherwise it returns a truthful stub
 (`"runtime": "stub"`) explaining why inference is unavailable.
 
 ### Claim payload
@@ -174,6 +193,9 @@ All settings are read from environment variables prefixed with `EXODUS_`:
 | `EXODUS_INFERENCE` | `true` | Enable chat inference; `0` returns the state stub |
 | `EXODUS_MAX_TOKENS` | `256` | Max generated tokens per chat reply |
 | `EXODUS_INFERENCE_TIMEOUT_SECONDS` | `300` | Kill llama-cli if a completion hangs past this |
+| `EXODUS_MAX_CONCURRENT_INFERENCE` | `1` | Max llama-cli processes running at once |
+| `EXODUS_DISTRIBUTED_INFERENCE` | `true` | Fan inference requests out to network peers |
+| `EXODUS_DISTRIBUTED_TIMEOUT_SECONDS` | `60` | Max wall time waiting for peer completions |
 | `EXODUS_NODE_NAME` | `exodus-node` | Human-readable node name |
 | `EXODUS_NODE_HOST` | `0.0.0.0` | Gossip listen address |
 | `EXODUS_NODE_PORT` | `52514` | Gossip TCP port |
@@ -187,6 +209,7 @@ All settings are read from environment variables prefixed with `EXODUS_`:
 | `EXODUS_BYZANTINE` | `true` | `2f+1` quorum (else simple majority) |
 | `EXODUS_CLAIM_DEDUP_WINDOW` | `256` | Claim dedup cache size |
 | `EXODUS_ACTIVE_PEER_WINDOW` | `5` | Heartbeats before a peer is considered active |
+| `EXODUS_SYNC_REQUEST_INTERVAL_SECONDS` | `5` | Interval between ledger sync requests |
 | `EXODUS_FLOPS_TOLERANCE` | `0.5` | Allowed FLOPS deviation |
 | `EXODUS_CREDITS_PER_CU` | `0.01` | Credits per compute unit |
 | `EXODUS_REWARD_DIMINISHING` | `0.85` | Reward curve exponent |
