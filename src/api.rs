@@ -549,6 +549,30 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
     //    agreement wins (ties broken by length, then the local node).
     let (selected, reply, agreement) = pick_agreed_reply(local_reply.as_deref(), &peer_replies);
 
+    // If nothing produced text (all attempts errored or emitted empty output —
+    // e.g. the model's chat template was not applied), surface the real reason
+    // in the reply so the chat is not a blank "(empty reply)".
+    let reply = if reply.is_empty() {
+        let reasons: Vec<String> = std::iter::once(if let Some(e) = &local_error {
+            Some(format!("local: {e}"))
+        } else {
+            None
+        })
+        .chain(peer_errors.iter().map(|(n, e)| Some(format!("{n}: {e}"))))
+        .flatten()
+        .collect();
+        let mut msg = "No completion was produced.".to_string();
+        if !reasons.is_empty() {
+            msg.push_str(if reasons.len() == 1 { " " } else { " Details: " });
+            msg.push_str(&reasons.join(" | "));
+        } else {
+            msg.push_str(" Check that the model exits and that the runtime supports it.");
+        }
+        msg
+    } else {
+        reply
+    };
+
     json!({
         "runtime": "distributed",
         "model": model,

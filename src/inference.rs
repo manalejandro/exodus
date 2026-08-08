@@ -156,7 +156,21 @@ pub fn complete(
     }
     let guard = out_buf.lock().unwrap();
     let text = String::from_utf8_lossy(&guard);
-    Ok(clean(&text))
+    let cleaned = clean(&text);
+    if cleaned.is_empty() {
+        // A successful run that emitted no tokens almost always means the
+        // model stopped immediately (e.g. the plain prompt is missing the
+        // model's chat-template tokens).  Report the llama stderr tail so the
+        // failure is visible in the UI instead of an empty reply.
+        let guard = err_buf.lock().unwrap();
+        let stderr = String::from_utf8_lossy(&guard);
+        return Err(format!(
+            "{bin} produced no output for {} (check the model's chat template / context size); stderr tail: {}",
+            model_path.display(),
+            stderr.trim().chars().rev().take(300).collect::<String>().chars().rev().collect::<String>()
+        ));
+    }
+    Ok(cleaned)
 }
 
 /// Trim surrounding whitespace and a leading `Assistant:` continuation marker
