@@ -25,6 +25,12 @@ use crate::inference::ChatTurn;
 struct ServerState {
     child: Option<Child>,
     model: Option<std::path::PathBuf>,
+    /// Actual port the running server is bound to (may differ from the
+    /// configured one when an ephemeral port was picked).
+    port: u16,
+    /// Where the server's stdout/stderr are captured, so a crash can be
+    /// diagnosed instead of silently failing to become ready.
+    log_path: std::path::PathBuf,
 }
 
 pub struct LlamaServer {
@@ -56,6 +62,8 @@ impl LlamaServer {
             state: Mutex::new(ServerState {
                 child: None,
                 model: None,
+                port,
+                log_path: std::path::PathBuf::new(),
             }),
         })
     }
@@ -68,7 +76,7 @@ impl LlamaServer {
         messages: &[ChatTurn],
         max_tokens: i64,
     ) -> Result<String, String> {
-        self.ensure_ready(model_path)?;
+        let port = self.ensure_ready(model_path)?;
         let body = json!({
             "messages": messages
                 .iter()
@@ -79,34 +87,18 @@ impl LlamaServer {
             "stream": false,
         })
         .to_string();
-        let resp = http_post_json(
-            &self.host,
-            self.port,
-            "/v1/chat/completions",
-            &body,
-            self.timeout,
-        )?;
+        let resp = http_post_json(&self.host, port, "/v1/chat/completions", &body, self.timeout)?;
         parse_chat_completion(&resp)
     }
 
     /// Ensure a llama-server is running and healthy for `model_path`, killing
     /// and relaunching it if the model changed or the process died.  The lock
     /// is held across a cold model load so concurrent calls wait for readiness
-    /// instead of double-starting the server.
-    fn ensure_ready(&self, model_path: &Path) -> Result<(), String> {
+    /// instead of double-starting the server.  Returns the port the server is
+    /// listening on.
+    fn ensure_ready(&self, model_path: &Path) -> Result<u16, String> {
         if !model_path.is_file() {
             return Err(format!("model file not found: {}", model_path.display()));
-        }
-        let mut st = self.state.lock().unwrap();
-        if st.model.as_deref() == Some(model_path) && self.health_ok() {
-            return Ok(());
-        }
-        if st.child.is_some() {
-            let _ = st.child.take().map(|mut c| {
-                let _ = c.kill();
-                let _ = c.wait();
-            });
-            st.model = None;
         }
         if !crate::inference::binary_exists(&self.bin) {
             return Err(format!(
@@ -114,27 +106,89 @@ impl LlamaServer {
                 self.bin
             ));
         }
+        let mut st = self.state.lock().unwrap();
+
+        // 1. Already running this model and healthy: reuse.
+        if st.child.is_some()
+            && st.model.as_deref() == Some(model_path)
+            && self.health_at(st.port)
+        {
+            return Ok(st.port);
+        }
+        // 2. A leftover llama-server from a previous run (e.g. the node was
+        //    SIGKILLed without running Drop) may still hold the configured
+        //    port.  If it is healthy *and* serving this exact model, adopt it
+        //    instead of failing to bind a second time.
+        if self.health_at(self.port)
+            && self
+                .server_model(self.port)
+                .as_deref()
+                .map(|id| model_matches(id, model_path))
+                .unwrap_or(false)
+        {
+            let _ = st.child.take().map(|mut c| {
+                let _ = c.kill();
+                let _ = c.wait();
+            });
+            st.model = Some(model_path.to_path_buf());
+            st.port = self.port;
+            return Ok(st.port);
+        }
+        // 3. Start fresh.  Use an ephemeral port so a stale process holding the
+        //    configured port cannot block startup, and capture the server's
+        //    output so a crash can be reported instead of a silent timeout.
+        let _ = st.child.take().map(|mut c| {
+            let _ = c.kill();
+            let _ = c.wait();
+        });
+        st.model = None;
+        let port = pick_free_port(&self.host);
+        let log_path = std::env::temp_dir().join(format!(
+            "exodus-llama-server-{}.log",
+            std::process::id()
+        ));
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .map_err(|e| format!("open server log {}: {e}", log_path.display()))?;
         let child = Command::new(&self.bin)
             .arg("-m")
             .arg(model_path)
             .arg("--host")
             .arg(&self.host)
             .arg("--port")
-            .arg(self.port.to_string())
+            .arg(port.to_string())
             .arg("--parallel")
             .arg(self.parallel.to_string())
             .arg("--gpu-layers")
             .arg(self.layers.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(
+                log.try_clone().map_err(|e| format!("log clone: {e}"))?,
+            ))
+            .stderr(Stdio::from(log))
             .stdin(Stdio::null())
             .spawn()
             .map_err(|e| format!("failed to start {}: {e}", self.bin))?;
         st.child = Some(child);
-        // Wait for the server to become ready (model load can take a while).
+        st.port = port;
+        st.log_path = log_path.clone();
+
+        // Wait for the server to become ready (model load can take a while),
+        // but bail out immediately if the process has already exited so the
+        // real error (with the server log tail) reaches the chat.
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            if self.health_ok() {
+            if let Some(status) = st.child.as_mut().and_then(|c| c.try_wait().ok().flatten()) {
+                let _ = st.child.take();
+                return Err(format!(
+                    "{} exited with {status}; llama-server log tail: {}",
+                    self.bin,
+                    read_tail(&st.log_path, 1500)
+                ));
+            }
+            if self.health_at(port) {
                 break;
             }
             if Instant::now() >= deadline {
@@ -143,21 +197,64 @@ impl LlamaServer {
                     let _ = c.wait();
                 });
                 return Err(format!(
-                    "llama-server did not become ready on {}:{} within 120s",
-                    self.host, self.port
+                    "llama-server did not become ready on {}:{} within 120s; llama-server log tail: {}",
+                    self.host,
+                    port,
+                    read_tail(&st.log_path, 1500)
                 ));
             }
             std::thread::sleep(Duration::from_millis(400));
         }
         st.model = Some(model_path.to_path_buf());
-        Ok(())
+        Ok(port)
     }
 
-    fn health_ok(&self) -> bool {
-        http_get(&self.host, self.port, "/health", Duration::from_secs(2))
-            .map(|b| b.trim() == "OK")
-            .unwrap_or(false)
+    /// Any HTTP 200 on `/health` counts as ready (the exact body varies across
+    /// llama.cpp versions: plain `OK` or `{"status":"ok"}`).
+    fn health_at(&self, port: u16) -> bool {
+        http_get(&self.host, port, "/health", Duration::from_secs(2)).is_ok()
     }
+
+    /// Ask a running server which model it loaded (llama-server puts the model
+    /// path in `data[0].id` of `/v1/models`).
+    fn server_model(&self, port: u16) -> Option<String> {
+        let resp = http_get(&self.host, port, "/v1/models", Duration::from_secs(2)).ok()?;
+        let v: Value = serde_json::from_str(&resp).ok()?;
+        v["data"][0]["id"].as_str().map(|s| s.to_string())
+    }
+}
+
+/// Whether a `/v1/models` id refers to `model_path` (llama-server reports the
+/// full path or just the file name depending on the build).
+fn model_matches(id: &str, model_path: &Path) -> bool {
+    let name = model_path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    !name.is_empty() && (id == model_path.to_string_lossy() || id.ends_with(&name))
+}
+
+/// Reserve an ephemeral TCP port by binding port 0 and dropping the listener.
+fn pick_free_port(host: &str) -> u16 {
+    std::net::TcpListener::bind((host, 0))
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(52516)
+}
+
+/// Last `n` characters of a file (best-effort).
+fn read_tail(path: &std::path::Path, n: usize) -> String {
+    let content = std::fs::read(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= n {
+        return content;
+    }
+    let start = chars.len() - n;
+    let tail: String = chars[start..].iter().collect();
+    format!("…(truncated)…{tail}")
 }
 
 impl Drop for LlamaServer {
@@ -414,5 +511,34 @@ mod tests {
     fn connection_refused_is_reported() {
         let err = http_get("127.0.0.1", 1, "/health", Duration::from_secs(2)).unwrap_err();
         assert!(err.contains("connect"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn model_matches_path_or_filename() {
+        let p = std::path::Path::new("/models/smollm2-360m-instruct-q8_0.gguf");
+        assert!(model_matches("/models/smollm2-360m-instruct-q8_0.gguf", p));
+        assert!(model_matches("smollm2-360m-instruct-q8_0.gguf", p));
+        assert!(!model_matches("/models/other.gguf", p));
+    }
+
+    #[test]
+    fn read_tail_caps_and_truncates() {
+        let dir = std::env::temp_dir().join(format!("exodus-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log.txt");
+        std::fs::write(&path, "abcde").unwrap();
+        assert_eq!(read_tail(&path, 100), "abcde");
+        assert!(read_tail(&path, 3).ends_with("cde"));
+        assert!(read_tail(&path, 3).starts_with("…(truncated)…"));
+        assert!(read_tail(&path.join("missing"), 10).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ephemeral_port_is_free() {
+        let p = pick_free_port("127.0.0.1");
+        assert!(p > 0);
+        let l = std::net::TcpListener::bind(("127.0.0.1", p)).unwrap();
+        drop(l);
     }
 }
