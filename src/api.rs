@@ -434,12 +434,24 @@ async fn chat_response(c: &Coord, model: &str, turns: &[crate::inference::ChatTu
             c.config.max_tokens,
             messages,
         );
-        let expected = c.consensus.active_peers().len().saturating_sub(1);
+        // Wait for the peers to answer.  A peer counts if it is known to the
+        // committee *or* the transport currently has a live TCP connection, so
+        // a fresh node whose heartbeats have not propagated yet still waits
+        // long enough for a slow llama-cli on the remote to reply.  A truly
+        // solo node (no committee member, no connected peer) gets a short
+        // grace window so its chat stays snappy.
+        let known_peers = c.consensus.active_peers().len().saturating_sub(1);
+        let connected_peers = c.transport.peer_count();
+        let expected = if known_peers > 0 {
+            known_peers
+        } else if connected_peers > 0 {
+            1
+        } else {
+            0
+        };
         let deadline = if expected > 0 {
             Duration::from_secs_f64(c.config.distributed_timeout_seconds.max(1.0))
         } else {
-            // No peers known yet: short grace window so late joiners can still
-            // answer without stalling a solo node's chat for the full timeout.
             Duration::from_secs_f64(c.config.distributed_timeout_seconds.min(3.0))
         };
         let collect = async {

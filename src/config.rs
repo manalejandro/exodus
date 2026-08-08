@@ -119,7 +119,7 @@ pub fn config_from_env() -> ExodusConfig {
         max_tokens: env_int("MAX_TOKENS", 256),
         inference_timeout_seconds: env_float("INFERENCE_TIMEOUT_SECONDS", 300.0),
         distributed_inference: env_bool("DISTRIBUTED_INFERENCE", true),
-        distributed_timeout_seconds: env_float("DISTRIBUTED_TIMEOUT_SECONDS", 30.0),
+        distributed_timeout_seconds: env_float("DISTRIBUTED_TIMEOUT_SECONDS", 60.0),
         epoch_seconds: env_float("EPOCH_SECONDS", 30.0),
         election_timeout_seconds: env_float("ELECTION_TIMEOUT_SECONDS", 90.0),
         byzantine: env_bool("BYZANTINE", true),

@@ -266,6 +266,10 @@ impl ExodusCoordinator {
         max_tokens: i64,
         messages: Vec<InferenceTurn>,
     ) -> tokio::sync::mpsc::UnboundedReceiver<InferenceResponse> {
+        eprintln!(
+            "[infer] node={} broadcasting request {} (model={})",
+            self.identity.node_id, request_id, model
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.infer_tx.lock().unwrap().insert(request_id.clone(), tx);
         let request = InferenceRequest {
@@ -295,6 +299,10 @@ impl ExodusCoordinator {
         }
         let tx = self.infer_tx.lock().unwrap().get(&response.request_id).cloned();
         if let Some(tx) = tx {
+            eprintln!(
+                "[infer] node={} collected reply for {} from {}",
+                self.identity.node_id, response.request_id, response.node_id
+            );
             let _ = tx.send(response);
         }
     }
@@ -308,12 +316,24 @@ impl ExodusCoordinator {
         if request.origin == self.identity.node_id {
             return;
         }
+        eprintln!(
+            "[infer] node={} got request {} from {} (model={}, turns={})",
+            self.identity.node_id,
+            request.request_id,
+            request.origin,
+            request.model,
+            request.messages.len(),
+        );
         let me = self.clone();
         let request = request.clone();
         thread::spawn(move || me.run_inference_request(&request));
     }
 
     fn run_inference_request(self: &Arc<Self>, request: &InferenceRequest) {
+        eprintln!(
+            "[infer] node={} running {} for {}",
+            self.identity.node_id, request.request_id, request.origin
+        );
         let started = Instant::now();
         let result = self.complete_for_request(request);
         let elapsed = started.elapsed().as_secs_f64();
@@ -321,6 +341,13 @@ impl ExodusCoordinator {
             Ok(reply) => (reply, None),
             Err(e) => (String::new(), Some(e)),
         };
+        eprintln!(
+            "[infer] node={} replying to {} (error={:?}, {}ms)",
+            self.identity.node_id,
+            request.request_id,
+            error.as_deref().map(|e| e.split('\n').next().unwrap_or("").to_string()),
+            (elapsed * 1000.0) as i64,
+        );
         let response = InferenceResponse {
             request_id: request.request_id.clone(),
             node_id: self.identity.node_id.clone(),
@@ -637,5 +664,93 @@ mod tests {
         assert!(rx.try_recv().is_err());
         solo.drop_inference("req-echo");
         solo.close();
+    }
+
+    /// End-to-end over the real TCP transport: node A asks for a distributed
+    /// completion and node B (a separate process on the same host) executes it.
+    /// Reproduces the deployed two-node topology without UDP discovery.
+    #[test]
+    fn real_tcp_fanout_reaches_peer() {
+        use crate::network::TcpTransport;
+
+        let p1: u16 = 55930;
+        let p2: u16 = 55931;
+        let base = std::env::temp_dir().join(format!(
+            "exodus-tcp-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut cfg = crate::config::config_from_env();
+        cfg.inference = false; // deterministic stub replies, no llama needed
+
+        let identity_a = crate::simulation::make_identity("a");
+        let identity_b = crate::simulation::make_identity("b");
+        let tcp_a: Arc<dyn Transport> = Arc::new(TcpTransport::new(
+            identity_a.node_id.clone(),
+            "127.0.0.1".into(),
+            p1,
+            vec![format!("127.0.0.1:{p2}")],
+            false,
+        ));
+        let tcp_b: Arc<dyn Transport> = Arc::new(TcpTransport::new(
+            identity_b.node_id.clone(),
+            "127.0.0.1".into(),
+            p2,
+            vec![],
+            false,
+        ));
+        tcp_a.start().unwrap();
+        tcp_b.start().unwrap();
+
+        let store_a = Arc::new(ChainStore::open(&base.join("a/ledger.sqlite3")).unwrap());
+        let store_b = Arc::new(ChainStore::open(&base.join("b/ledger.sqlite3")).unwrap());
+        let a = ExodusCoordinator::new(identity_a, store_a, tcp_a.clone(), cfg.clone(), None);
+        let b = ExodusCoordinator::new(identity_b, store_b, tcp_b.clone(), cfg.clone(), None);
+        a.connect();
+        b.connect();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while tcp_a.peer_count() < 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            tcp_a.peer_count() >= 1,
+            "node A never established a TCP connection to node B"
+        );
+
+        let turns = vec![InferenceTurn {
+            role: "user".into(),
+            content: "hello".into(),
+        }];
+        let mut rx = a.request_inference(
+            "tcp-req".into(),
+            "Mistral-7B-Instruct-v0.3-4bit.gguf".into(),
+            32,
+            turns,
+        );
+        let mut got: Vec<InferenceResponse> = Vec::new();
+        let collect_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            while let Ok(r) = rx.try_recv() {
+                got.push(r);
+            }
+            if !got.is_empty() || Instant::now() > collect_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        a.drop_inference("tcp-req");
+
+        assert_eq!(got.len(), 1, "expected the remote TCP peer to reply");
+        assert_eq!(got[0].node_id, b.identity.node_id);
+        assert!(got[0].error.is_none(), "unexpected error: {:?}", got[0].error);
+        assert!(
+            got[0].reply.starts_with("[node:"),
+            "unexpected reply: {}",
+            got[0].reply
+        );
+
+        tcp_b.close();
+        tcp_a.close();
     }
 }
