@@ -135,7 +135,7 @@ pub fn config_from_env() -> ExodusConfig {
         distributed_inference: env_bool("DISTRIBUTED_INFERENCE", true),
         distributed_timeout_seconds: env_float("DISTRIBUTED_TIMEOUT_SECONDS", 60.0),
         inference_backend: env_str("INFERENCE_BACKEND", "server"),
-        llama_server_bin: env_str("LLAMA_SERVER_BIN", "llama-server"),
+        llama_server_bin: env_str("LLAMA_SERVER_BIN", "/opt/llama.cpp/llama-server"),
         llama_server_host: env_str("LLAMA_SERVER_HOST", "127.0.0.1"),
         llama_server_port: env_int("LLAMA_SERVER_PORT", 52516) as u16,
         llama_server_parallel: env_int("LLAMA_SERVER_PARALLEL", max_concurrent as i64)
