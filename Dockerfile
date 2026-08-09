@@ -1,44 +1,31 @@
 # syntax=docker/dockerfile:1
 
-# ---- llama.cpp (built from source with CUDA) -----------------------------
-# llama.cpp releases only publish CUDA binaries for Windows; Linux CUDA builds
-# must be compiled from source.  Pin the release and build with the CUDA
-# backend so inference layers can be offloaded onto the VRAM.  Tune
-# LLAMA_VERSION/CUDA_VERSION/UBUNTU_VERSION/LLAMA_CUDA_ARCH via build args.
+# ---- llama.cpp (prebuilt Vulkan release) --------------------------------
+# llama.cpp publishes prebuilt Linux binaries for the Vulkan backend (CUDA
+# prebuilds are Windows-only).  Vulkan runs on NVIDIA GPUs, so no source
+# build is needed.  Swap LLAMA_ASSET for the CPU variant if no GPU is used.
 ARG LLAMA_VERSION=b10276
+ARG LLAMA_ASSET=llama-${LLAMA_VERSION}-bin-ubuntu-vulkan-x64.tar.gz
 ARG CUDA_VERSION=12.8.1
 ARG UBUNTU_VERSION=24.04
-ARG LLAMA_CUDA_ARCH=all-major
 
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS llamacpp
+FROM debian:bookworm-slim AS llamacpp
 ARG LLAMA_VERSION
-ARG LLAMA_CUDA_ARCH
+ARG LLAMA_ASSET
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-       git cmake build-essential ca-certificates python3 \
+    && apt-get install -y --no-install-recommends wget ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && git clone --branch ${LLAMA_VERSION} --depth 1 \
-       https://github.com/ggml-org/llama.cpp /opt/llama-src
-WORKDIR /opt/llama-src
-RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_NATIVE=OFF \
-        -DGGML_CUDA=ON \
-        -DGGML_BACKEND_DL=ON \
-        -DLLAMA_BUILD_TESTS=OFF \
-        -DCMAKE_CUDA_ARCHITECTURES=${LLAMA_CUDA_ARCH} \
-    && cmake --build build --config Release -j"$(nproc)" \
-       --target llama-cli llama-server
-# ggml looks for `libggml-cuda.so` next to the executable (and honours
-# LD_LIBRARY_PATH), so drop every shared artifact beside the binaries.
-RUN mkdir -p /opt/llama.cpp \
-    && cp build/bin/llama-cli build/bin/llama-server /opt/llama.cpp/ \
-    && find build -name "*.so*" -exec cp -P {} /opt/llama.cpp/ \; \
-    && rm -rf /opt/llama-src
+    && wget -q -O /llama.tar.gz \
+       "https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_VERSION}/${LLAMA_ASSET}" \
+    && mkdir -p /opt/llama.cpp \
+    && tar xzf /llama.tar.gz -C /opt/llama.cpp --strip-components=1 \
+    && rm /llama.tar.gz
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.97-bookworm AS builder
 WORKDIR /build
 
+# rusqlite ("bundled") compiles SQLite from source -> needs a C toolchain.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -47,26 +34,28 @@ COPY Cargo.toml ./
 COPY src ./src
 RUN cargo build --release
 
-# ---- runtime (CUDA runtime libraries + host GPU wired by the toolkit) ----
+# ---- runtime (nvidia runtime base + Vulkan loader) -----------------------
+# The nvidia/cuda base ships the CUDA runtime libs; the host GPU driver and
+# Vulkan ICD are mounted automatically by the NVIDIA Container Toolkit at
+# runtime (`gpus:` / `deploy.resources` in compose).
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
 
-# The nvidia/cuda base already ships libcudart/libcublas/etc.; the host GPU
-# driver libs and /dev/nvidia* are mounted automatically by the NVIDIA
-# Container Toolkit at runtime (`gpus:` / `deploy.resources` in compose).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates tini wget \
        libgomp1 libstdc++6 libssl3t64 \
+       libvulkan1 \
     && rm -rf /var/lib/apt/lists/* \
     && adduser --disabled-password --gecos "" --home /home/exodus exodus
 
 COPY --from=builder /build/target/release/exodus /usr/local/bin/exodus
 COPY --from=llamacpp /opt/llama.cpp /opt/llama.cpp
 
+# graphics capability is required for the NVIDIA Vulkan ICD.
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
-# llama-cli/llama-server find the ggml CUDA backend .so via LD_LIBRARY_PATH.
+# llama-cli/llama-server find the ggml Vulkan/CUDA backend .so via LD_LIBRARY_PATH.
 ENV LD_LIBRARY_PATH=/opt/llama.cpp
 
 ENV EXODUS_DATA_DIR=/data \

@@ -1,13 +1,13 @@
 services:
   node:
-    build:
+build:
       context: .
       dockerfile: Dockerfile
-      # args:
-        # LLAMA_VERSION: "b10276"     # llama.cpp release tag (git tag)
-        # CUDA_VERSION: "12.8.1"        # nvidia/cuda base + toolkit version
+      args:
+        # LLAMA_VERSION: "b10276"     # llama.cpp release tag
+        # LLAMA_ASSET: "llama-b10276-bin-ubuntu-vulkan-x64.tar.gz" # or -ubuntu-x64 for CPU
+        # CUDA_VERSION: "12.8.1"        # nvidia/cuda runtime base
         # UBUNTU_VERSION: "24.04"
-        # LLAMA_CUDA_ARCH: "all-major"  # -DCMAKE_CUDA_ARCHITECTURES
     image: exodus:latest
     container_name: exodus-node
     restart: unless-stopped
@@ -16,9 +16,9 @@ services:
     # Requires the NVIDIA Container Toolkit on the host:
     #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit
     #
-    # This injects the host GPU driver; the image bundles the CUDA runtime
-    # libs (nvidia/cuda base) and a llama.cpp build with the CUDA backend, so
-    # model layers are offloaded to the VRAM.
+    # This injects the host GPU driver; the image runs on an nvidia/cuda base
+    # and bundles the prebuilt llama.cpp Vulkan build, so model layers are
+    # offloaded to the VRAM via the NVIDIA Vulkan ICD.
     #
     # Legacy alternative: add `gpus: all` here instead of the deploy block.
     deploy:

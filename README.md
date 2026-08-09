@@ -235,13 +235,14 @@ Container Toolkit (`deploy.resources.reservations.devices` in `docker-compose.ym
 or the legacy `gpus: all`) and reports it via `/exodus/models` and
 `/exodus/status`.
 
-The image compiles llama.cpp from source with the CUDA backend (llama.cpp
-publishes prebuilt CUDA binaries only for Windows) and runs on an
+The image bundles the prebuilt llama.cpp Vulkan release (pinned in the
+`llamacpp` build stage) as `/opt/llama.cpp/llama-cli` and runs on an
 `nvidia/cuda` runtime base, so `POST /exodus/chat` offloads model layers onto
-the VRAM as soon as a `.gguf` model file is present in the models volume. Tune
-the build with the `LLAMA_VERSION`, `CUDA_VERSION`, `UBUNTU_VERSION` and
-`LLAMA_CUDA_ARCH` build args (see `docker-compose.yml`), and `EXODUS_GPU_LAYERS`
-controls how many layers move to the GPU at runtime.
+the VRAM through the NVIDIA Vulkan ICD as soon as a `.gguf` model file is
+present in the models volume. Tune the build with the `LLAMA_VERSION`,
+`LLAMA_ASSET`, `CUDA_VERSION` and `UBUNTU_VERSION` build args (see
+`docker-compose.yml`), and `EXODUS_GPU_LAYERS` controls how many layers move
+to the GPU at runtime.
 
 ## Simulation
 
