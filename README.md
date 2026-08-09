@@ -264,6 +264,15 @@ cargo clippy     # lints
 cargo run -- simulate
 ```
 
+Cross-compiling for Windows x64 (requires the `x86_64-pc-windows-gnu` target
+and a mingw linker, e.g. `gcc-mingw-w64-x86-64`):
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+  cargo build --release --target x86_64-pc-windows-gnu
+```
+
 ## License
 
 [MIT](LICENSE)

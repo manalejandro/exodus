@@ -1,7 +1,6 @@
 //! Node identity: a persistent Ed25519 key pair stored in `<data_dir>/identity.key`.
 
 use std::fs;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::crypto::{generate_key_pair, hex, hex_decode, node_id_from_public_key};
@@ -62,7 +61,13 @@ fn create_identity(path: &Path) -> Result<NodeIdentity, IdentityError> {
     );
 
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true).mode(0o600);
+    opts.write(true).create_new(true);
+    // Restrict permissions to the owner where the platform supports it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
     let mut handle = opts.open(path).map_err(|e| IdentityError(e.to_string()))?;
     use std::io::Write;
     handle

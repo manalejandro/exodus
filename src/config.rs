@@ -114,6 +114,14 @@ fn env_list(name: &str, default: Vec<String>) -> Vec<String> {
 }
 
 fn default_data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata).join("exodus");
+            }
+        }
+    }
     let base = env::var("XDG_DATA_HOME").unwrap_or_else(|_| "~/.local/share".to_string());
     // expand a leading `~`
     if let Some(rest) = base.strip_prefix("~/") {
