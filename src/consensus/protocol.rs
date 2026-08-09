@@ -44,6 +44,10 @@ struct ProtocolState {
     last_activity: f64,
 
     peers: HashMap<String, Heartbeat>,
+    /// Last time a heartbeat was received from each peer (monotonic seconds),
+    /// used to prune peers that left the network so they stop counting as
+    /// "connected" in the committee / peer list.
+    peer_seen: HashMap<String, f64>,
     pending_commits: BTreeMap<i64, Checkpoint>,
     recent_fork_alerts: HashSet<String>,
     recent_commit_rejects: VecDeque<String>,
@@ -186,6 +190,7 @@ impl ConsensusProtocol {
                 view: 1,
                 last_activity: monotonic_now(),
                 peers: HashMap::new(),
+                peer_seen: HashMap::new(),
                 pending_commits: BTreeMap::new(),
                 recent_fork_alerts: HashSet::new(),
                 recent_commit_rejects: VecDeque::new(),
@@ -247,6 +252,25 @@ impl ConsensusProtocol {
 
     pub fn peer_count(&self) -> usize {
         self.inner.lock().unwrap().peers.len()
+    }
+
+    #[cfg(test)]
+    /// Test-only: register a peer heartbeat with an explicit last-seen time,
+    /// so tests can exercise stale-peer pruning without a live transport.
+    pub fn test_inject_peer(&self, node_id: &str, height: i64, seen: f64) {
+        let mut state = self.inner.lock().unwrap();
+        state.peers.insert(
+            node_id.to_string(),
+            Heartbeat {
+                node_id: node_id.to_string(),
+                height,
+                block_hash: String::new(),
+                epoch: 0,
+                sealed_by: String::new(),
+                quorum_weight: 1,
+            },
+        );
+        state.peer_seen.insert(node_id.to_string(), seen);
     }
 
     pub fn quorum_size(&self) -> usize {
@@ -366,6 +390,10 @@ impl ConsensusProtocol {
         let (drained, takeover) = {
             let mut state = self.inner.lock().unwrap();
             let now = (self.now_fn)();
+            // Drop peers we have not heard from for a few heartbeat intervals
+            // so a node that left the network stops counting as a connected
+            // peer / committee member after a short grace period.
+            state.prune_stale_peers(now, self.config.peer_stale_after());
             let mut takeover = false;
             if now - state.last_activity > self.config.election_timeout_seconds {
                 let was_sealer =
@@ -794,6 +822,7 @@ impl ProtocolState {
             return;
         }
         self.peers.insert(hb.node_id.clone(), hb.clone());
+        self.peer_seen.insert(hb.node_id.clone(), monotonic_now());
         let head = store.head();
         let Some(head) = head else {
             self.request_sync(-1);
@@ -814,6 +843,21 @@ impl ProtocolState {
                 }),
             ));
         }
+    }
+
+    /// Remove peers whose last heartbeat is older than `stale_after` seconds,
+    /// so a disconnected node stops appearing in the committee and peer list.
+    fn prune_stale_peers(&mut self, now: f64, stale_after: f64) {
+        if stale_after <= 0.0 {
+            return;
+        }
+        let cutoff = now - stale_after;
+        self.peers.retain(|id, _| {
+            self.peer_seen
+                .get(id)
+                .map(|t| *t > cutoff)
+                .unwrap_or(true)
+        });
     }
 
     fn on_fork(&mut self, alert: ForkAlert) {
@@ -1141,6 +1185,7 @@ mod tests {
             view: 1,
             last_activity: monotonic_now(),
             peers: HashMap::new(),
+            peer_seen: HashMap::new(),
             pending_commits: BTreeMap::new(),
             recent_fork_alerts: HashSet::new(),
             recent_commit_rejects: VecDeque::new(),

@@ -69,6 +69,15 @@ impl ExodusConfig {
             .clone()
             .unwrap_or_else(|| self.data_dir.join("models"))
     }
+
+    /// Seconds of silence after which a peer is considered disconnected.
+    /// Heartbeats are broadcast every `min(heartbeat_seconds, epoch_seconds)`,
+    /// so a peer that goes quiet for a few intervals is treated as gone and
+    /// stops counting in the committee / peer list.
+    pub fn peer_stale_after(&self) -> f64 {
+        let cadence = self.heartbeat_seconds.min(self.epoch_seconds);
+        (cadence * 4.0).max(15.0)
+    }
 }
 
 fn env_str(name: &str, default: &str) -> String {

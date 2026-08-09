@@ -318,10 +318,28 @@ impl ExodusCoordinator {
         if stats.node_id == self.identity.node_id {
             return;
         }
+        let now = Instant::now();
         let mut map = self.peer_stats.lock().unwrap();
-        map.insert(stats.node_id.clone(), (stats, Instant::now()));
-        let cutoff = Instant::now() - Duration::from_secs(30);
+        map.insert(stats.node_id.clone(), (stats, now));
+        let cutoff = now - self.telemetry_ttl();
         map.retain(|_, (_, at)| *at > cutoff);
+    }
+
+    /// Drop telemetry for peers that stopped announcing longer than the TTL
+    /// ago, so a disconnected node stops contributing to the distributed
+    /// totals even though no new announcements arrive to trigger the pruning.
+    fn prune_peer_stats(&self) {
+        let cutoff = Instant::now() - self.telemetry_ttl();
+        let mut map = self.peer_stats.lock().unwrap();
+        map.retain(|_, (_, at)| *at > cutoff);
+    }
+
+    /// How long a peer's last telemetry is considered fresh.  Announcements
+    /// are broadcast every `heartbeat_seconds.min(epoch_seconds)` (10s by
+    /// default); a peer that goes quiet for a few intervals is treated as gone.
+    fn telemetry_ttl(&self) -> Duration {
+        let cadence = self.config.heartbeat_seconds.min(self.config.epoch_seconds);
+        Duration::from_secs_f64((cadence * 3.0).max(15.0))
     }
 
     /// Aggregate capacity across every peer that has announced recently,
@@ -340,6 +358,10 @@ impl ExodusCoordinator {
         };
         let mut nodes: Vec<NodeStats> = Vec::new();
         nodes.push(local);
+        // Prune on read so the aggregate reflects the network as it is *right
+        // now*: a peer that disconnected and stopped announcing must not keep
+        // inflating the memory/process/node totals.
+        self.prune_peer_stats();
         let mut peers = {
             let map = self.peer_stats.lock().unwrap();
             map.values().map(|(s, _)| s.clone()).collect::<Vec<_>>()
@@ -763,6 +785,7 @@ impl ExodusCoordinator {
         loop {
             consensus.tick();
             self.announce_telemetry();
+            self.prune_peer_stats();
             if consensus.is_sealer() {
                 consensus.propose_now();
             }
@@ -869,12 +892,78 @@ mod tests {
             content: "hi".into(),
         }];
         let mut rx = solo.request_inference("req-echo".into(), "m.gguf".into(), 16, turns);
-        // The published request is delivered locally too; the solo node must
+// The published request is delivered locally too; the solo node must
         // ignore its own echo and never receive a response for itself.
         std::thread::sleep(Duration::from_millis(100));
         assert!(rx.try_recv().is_err());
         solo.drop_inference("req-echo");
         solo.close();
+    }
+
+    #[test]
+    fn distributed_capacity_drops_silent_peers() {
+        let transport: Arc<dyn Transport> = Arc::new(LocalTransport::new());
+        let base = std::env::temp_dir().join(format!(
+            "exodus-telemetry-ttl-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut cfg = crate::config::config_from_env();
+        cfg.inference = false;
+        let c = coord(&transport, &base, &cfg);
+
+        // A remote telemetry announcement is absorbed…
+        let remote = crate::models::NodeStats {
+            node_id: "exdremote".into(),
+            cpu_cores: 8,
+            mem_total_mb: 16000,
+            processes: 4,
+            gpu_vram_mb: 0,
+            gpu_available: false,
+        };
+        c.on_node_stats(serde_json::to_value(&remote).unwrap());
+        let with_peer = c.distributed_capacity();
+        assert_eq!(with_peer["node_count"], 2, "peer must be counted: {with_peer}");
+
+        // Faking the last-seen timestamp into the past makes it stale; a read
+        // must then prune it so totals reflect only live peers.
+        {
+            let mut map = c.peer_stats.lock().unwrap();
+            for v in map.values_mut() {
+                v.1 = Instant::now() - Duration::from_secs(3600);
+            }
+        }
+        let after = c.distributed_capacity();
+        assert_eq!(after["node_count"], 1, "stale peer must be dropped: {after}");
+
+        c.close();
+    }
+
+    #[test]
+    fn stale_peers_pruned_from_consensus() {
+        let transport: Arc<dyn Transport> = Arc::new(LocalTransport::new());
+        let base = std::env::temp_dir().join(format!(
+            "exodus-peer-ttl-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let mut cfg = crate::config::config_from_env();
+        cfg.inference = false;
+        let c = coord(&transport, &base, &cfg);
+
+        // Insert a peer with a backdated last-seen via a fake heartbeat, then
+        // a tick must drop it from the peer/committee lists.  `seen = 1.0` is
+        // far older than any stale threshold.
+        c.consensus.test_inject_peer("exdside-0000000000000000000000001", 0, 1.0);
+        c.consensus.tick();
+        let mut peers = c.consensus.active_peers();
+        peers.retain(|id| id != &c.identity.node_id);
+        assert!(
+            peers.is_empty(),
+            "stale peer must be pruned from consensus: {peers:?}"
+        );
+
+        c.close();
     }
 
     /// End-to-end over the real TCP transport: node A asks for a distributed
