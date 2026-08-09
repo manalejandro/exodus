@@ -6,3 +6,7 @@ Cargo.lock
 Dockerfile
 docker-compose*.yml
 README.md
+exodus-data
+exodus-models
+identity.key
+*.gguf

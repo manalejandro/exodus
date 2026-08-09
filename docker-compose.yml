@@ -76,7 +76,7 @@ build:
       dockerfile: Dockerfile
     image: exodus:latest
     profiles: ["simulate"]
-    command: ["exodus", "simulate"]
+    command: ["simulate"]
 
 volumes:
   exodus-data:

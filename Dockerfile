@@ -50,6 +50,8 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/exodus /usr/local/bin/exodus
 COPY --from=llamacpp /opt/llama.cpp /opt/llama.cpp
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # graphics capability is required for the NVIDIA Vulkan ICD.
 ENV NVIDIA_VISIBLE_DEVICES=all \
@@ -70,7 +72,8 @@ ENV EXODUS_DATA_DIR=/data \
 
 RUN mkdir -p /data /models && chown -R exodus:exodus /data /models
 
-USER exodus
+# Run as root so the entrypoint can chown the bind-mounted volumes; it then
+# drops to the unprivileged `exodus` user before starting the node.
 WORKDIR /home/exodus
 
 # UDP multicast discovery / TCP gossip / REST API
@@ -78,5 +81,5 @@ EXPOSE 52513/udp 52514/tcp 52515/tcp
 
 VOLUME ["/data", "/models"]
 
-ENTRYPOINT ["tini", "--"]
-CMD ["exodus", "run", "--api"]
+ENTRYPOINT ["tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+CMD ["run", "--api"]
