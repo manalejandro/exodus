@@ -235,12 +235,13 @@ Container Toolkit (`deploy.resources.reservations.devices` in `docker-compose.ym
 or the legacy `gpus: all`) and reports it via `/exodus/models` and
 `/exodus/status`.
 
-The image bundles a prebuilt llama.cpp release (pinned in the `llamacpp` build
-stage) as `/opt/llama.cpp/llama-cli`, so `POST /exodus/chat` runs real
-inference as soon as a `.gguf` model file is present in the models volume.
-To switch the runtime backend, pass a different `LLAMA_ASSET` build arg (e.g.
-`llama-b10276-bin-ubuntu-vulkan-x64.tar.gz`); `EXODUS_LLAMA_BIN` overrides the
-binary path at runtime.
+The image compiles llama.cpp from source with the CUDA backend (llama.cpp
+publishes prebuilt CUDA binaries only for Windows) and runs on an
+`nvidia/cuda` runtime base, so `POST /exodus/chat` offloads model layers onto
+the VRAM as soon as a `.gguf` model file is present in the models volume. Tune
+the build with the `LLAMA_VERSION`, `CUDA_VERSION`, `UBUNTU_VERSION` and
+`LLAMA_CUDA_ARCH` build args (see `docker-compose.yml`), and `EXODUS_GPU_LAYERS`
+controls how many layers move to the GPU at runtime.
 
 ## Simulation
 
