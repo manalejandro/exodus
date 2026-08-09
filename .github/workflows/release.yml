@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: windows-x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1
+        with:
+          toolchain: stable
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: exodus-${{ matrix.name }}
+          path: |
+            target/release/exodus
+            target/release/exodus.exe
+
+  release:
+    name: Create release and attach binaries
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Rename binaries
+        shell: bash
+        run: |
+          mv dist/exodus-linux-x86_64/exodus dist/exodus-linux-x86_64/exodus-linux-x86_64
+          mv dist/exodus-windows-x86_64/exodus.exe dist/exodus-windows-x86_64/exodus-windows-x86_64.exe
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Exodus ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/exodus-linux-x86_64/exodus-linux-x86_64
+            dist/exodus-windows-x86_64/exodus-windows-x86_64.exe
