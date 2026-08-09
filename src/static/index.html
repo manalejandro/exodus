@@ -9,6 +9,7 @@
     --bg: #0f1115; --panel: #171a21; --line: #262c38;
     --fg: #d7dde6; --dim: #8b95a5; --accent: #7ee0a3;
     --warn: #ffd479; --err: #ff7b72; --link: #79b8ff;
+    --code-bg: #0d1117; --code-header-bg: #161b22; --code-border: #30363d;
   }
   * { box-sizing: border-box; }
   body {
@@ -31,21 +32,110 @@
   #statusbar .gpu.ok { color: var(--accent); border-color: #2c6a44; }
   #conv {
     flex: 1; overflow-y: auto; padding: 1.25rem 1.5rem; display: flex; flex-direction: column; gap: .9rem;
-    max-width: 900px; width: 100%; margin: 0 auto;
+    max-width: 960px; width: 100%; margin: 0 auto;
   }
-  .msg { max-width: 78%; padding: .6rem .9rem; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
-  .msg .role { display: block; font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; margin-bottom: .25rem; }
+  .msg { max-width: 88%; padding: .75rem 1rem; border-radius: 12px; line-height: 1.6; word-break: break-word; }
+  .msg .role { display: block; font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; margin-bottom: .4rem; }
   .msg.user { align-self: flex-end; background: #12351f; border: 1px solid #2c6a44; }
   .msg.user .role { color: var(--accent); }
-  .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); }
+  .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--line); width: 100%; max-width: 88%; }
   .msg.assistant .role { color: var(--dim); }
   .msg.error { align-self: flex-start; background: #3a1d1c; border: 1px solid #6a2c2a; color: var(--err); }
+  .msg-text { white-space: pre-wrap; word-break: break-word; }
+  .msg-text:empty { display: none; }
+  
+  /* Inline code */
+  .inline-code {
+    background: rgba(110, 118, 129, 0.25);
+    border: 1px solid rgba(240, 246, 252, 0.15);
+    color: #ff9b9b;
+    padding: 0.15em 0.45em;
+    border-radius: 5px;
+    font-family: inherit;
+    font-size: 0.9em;
+  }
+
+  /* Code container block */
+  .code-container {
+    margin: 0.75rem 0;
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+  }
+  .code-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--code-header-bg);
+    padding: 0.35rem 0.8rem;
+    border-bottom: 1px solid #21262d;
+    font-size: 0.72rem;
+    user-select: none;
+  }
+  .code-lang {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+  }
+  .copy-btn {
+    background: #21262d;
+    border: 1px solid var(--code-border);
+    color: #c9d1d9;
+    border-radius: 6px;
+    padding: 0.22rem 0.55rem;
+    font-size: 0.72rem;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-family: inherit;
+    transition: all 0.15s ease-in-out;
+  }
+  .copy-btn:hover {
+    background: #30363d;
+    color: #ffffff;
+    border-color: #8b949e;
+  }
+  .copy-btn.copied {
+    background: #12351f;
+    color: var(--accent);
+    border-color: #2c6a44;
+  }
+  .code-body {
+    margin: 0;
+    padding: 0.85rem 1rem;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.55;
+    background: var(--code-bg);
+    color: #e6edf3;
+  }
+  .code-body code {
+    font-family: inherit;
+  }
+
+  /* Syntax Highlighting Tokens */
+  .tok-kw { color: #ff7b72; font-weight: 600; }        /* Keywords (if, else, return, def, fn) */
+  .tok-type { color: #79b8ff; font-weight: 500; }      /* Types (int, float, void, bool, String) */
+  .tok-builtin { color: #ffa657; font-weight: 500; }   /* Built-in functions (printf, scanf, print) */
+  .tok-fn { color: #d2a8ff; }                          /* Function definitions & calls (fibonacci, main) */
+  .tok-str { color: #a5d6ff; }                         /* Strings ("...", '...') */
+  .tok-num { color: #79c0ff; }                         /* Numbers (10, 0.5, 0xFF) */
+  .tok-comment { color: #8b949e; font-style: italic; } /* Comments (//..., #...) */
+  .tok-prep { color: #ff7b72; font-weight: 500; }      /* Preprocessor (#include, #define) */
+  .tok-op { color: #79b8ff; }                          /* Operators (+, -, <=, ==, =) */
+  .tok-ident { color: #e6edf3; }                       /* Identifiers / variables */
+
   .typing { align-self: flex-start; color: var(--dim); padding: .6rem .9rem; border: 1px dashed var(--line); border-radius: 12px; }
   .typing::after { content: "▋"; animation: blink 1s step-start infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   form#chatbar {
     display: flex; gap: .6rem; padding: .9rem 1.5rem 1.25rem; border-top: 1px solid var(--line);
-    max-width: 900px; width: 100%; margin: 0 auto; align-items: center;
+    max-width: 960px; width: 100%; margin: 0 auto; align-items: center;
   }
   #model { background: #10141b; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: .55rem .7rem; font: inherit; max-width: 260px; }
   textarea {
@@ -53,16 +143,16 @@
     padding: .6rem .8rem; font: inherit; resize: none; min-height: 44px; max-height: 160px; outline: none;
   }
   textarea:focus { border-color: var(--accent); }
-  button {
+  button[type="submit"] {
     background: #12351f; border: 1px solid #2c6a44; color: var(--accent); border-radius: 8px;
     padding: .6rem 1.1rem; font: inherit; cursor: pointer; white-space: nowrap;
   }
-  button:hover { border-color: var(--accent); }
+  button[type="submit"]:hover { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: not-allowed; }
-  button.ghost { background: #1d2733; border-color: #33404f; color: var(--fg); }
+  button.ghost { background: #1d2733; border: 1px solid #33404f; color: var(--fg); border-radius: 8px; padding: .6rem 1rem; font: inherit; cursor: pointer; }
   .empty { color: var(--dim); text-align: center; margin: auto; }
   .empty .big { font-size: 2.2rem; color: var(--accent); }
-  @media (max-width: 720px) { .msg { max-width: 92%; } #model { max-width: none; width: 100%; } form#chatbar { flex-wrap: wrap; } textarea { min-width: 100%; } }
+  @media (max-width: 720px) { .msg { max-width: 95%; } #model { max-width: none; width: 100%; } form#chatbar { flex-wrap: wrap; } textarea { min-width: 100%; } }
 </style>
 </head>
 <body>
@@ -105,6 +195,262 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const conv = $("conv");
 const history = [];
 
+const LANG_MAP = {
+  c: "C", cpp: "C++", "c++": "C++", h: "C Header", hpp: "C++ Header",
+  py: "Python", python: "Python",
+  rs: "Rust", rust: "Rust",
+  js: "JavaScript", javascript: "JavaScript", jsx: "React JSX",
+  ts: "TypeScript", typescript: "TypeScript", tsx: "React TSX",
+  html: "HTML", xml: "XML",
+  css: "CSS", scss: "SCSS",
+  json: "JSON",
+  sh: "Bash", bash: "Bash", shell: "Shell", zsh: "Zsh",
+  sql: "SQL",
+  go: "Go", golang: "Go",
+  java: "Java",
+  yaml: "YAML", yml: "YAML",
+  toml: "TOML",
+  dockerfile: "Dockerfile", docker: "Docker"
+};
+
+const KEYWORDS_BY_LANG = {
+  c: new Set([
+    "auto","break","case","const","continue","default","do","else","enum","extern",
+    "for","goto","if","inline","register","restrict","return","sizeof","static","struct",
+    "switch","typedef","union","volatile","while","class","namespace","public","private",
+    "protected","template","typename","using","virtual","override","constexpr","nullptr",
+    "new","delete","this","throw","try","catch"
+  ]),
+  cpp: new Set([
+    "auto","break","case","const","continue","default","do","else","enum","extern",
+    "for","goto","if","inline","register","restrict","return","sizeof","static","struct",
+    "switch","typedef","union","volatile","while","class","namespace","public","private",
+    "protected","template","typename","using","virtual","override","constexpr","nullptr",
+    "new","delete","this","throw","try","catch","std"
+  ]),
+  python: new Set([
+    "and","as","assert","async","await","break","class","continue","def","del","elif",
+    "else","except","finally","for","from","global","if","import","in","is","lambda",
+    "nonlocal","not","or","pass","raise","return","try","while","with","yield","self"
+  ]),
+  rust: new Set([
+    "as","async","await","break","const","continue","crate","dyn","else","enum","extern",
+    "false","fn","for","if","impl","in","let","loop","match","mod","move","mut","pub",
+    "ref","return","self","Self","static","struct","super","trait","true","type","unsafe",
+    "use","where","while"
+  ]),
+  javascript: new Set([
+    "async","await","break","case","catch","class","const","continue","debugger","default",
+    "delete","do","else","export","extends","finally","for","function","if","import","in",
+    "instanceof","let","new","return","super","switch","this","throw","try","typeof","var",
+    "void","while","with","yield","of"
+  ]),
+  go: new Set([
+    "break","default","func","interface","select","case","defer","go","map","struct",
+    "chan","else","goto","package","switch","const","fallthrough","if","range","type",
+    "continue","for","import","return","var"
+  ]),
+  sql: new Set([
+    "SELECT","FROM","WHERE","INSERT","INTO","UPDATE","DELETE","CREATE","TABLE","ALTER",
+    "DROP","JOIN","INNER","LEFT","RIGHT","FULL","ON","GROUP","BY","ORDER","ASC","DESC",
+    "LIMIT","OFFSET","HAVING","UNION","ALL","AS","AND","OR","NOT","NULL","IS","PRIMARY",
+    "KEY","FOREIGN","REFERENCES","DEFAULT","INDEX","COUNT","SUM","AVG","MIN","MAX"
+  ]),
+  json: new Set([])
+};
+
+const TYPES_BY_LANG = {
+  c: new Set([
+    "char","double","float","int","long","short","signed","unsigned","void","bool",
+    "size_t","ssize_t","int8_t","int16_t","int32_t","int64_t","uint8_t","uint16_t",
+    "uint32_t","uint64_t","FILE","string","vector","map","set","pair"
+  ]),
+  cpp: new Set([
+    "char","double","float","int","long","short","signed","unsigned","void","bool",
+    "size_t","ssize_t","int8_t","int16_t","int32_t","int64_t","uint8_t","uint16_t",
+    "uint32_t","uint64_t","string","vector","map","set","pair","shared_ptr","unique_ptr"
+  ]),
+  python: new Set(["int","float","str","bool","list","dict","set","tuple","bytes","None","True","False"]),
+  rust: new Set([
+    "i8","i16","i32","i64","i128","isize","u8","u16","u32","u64","u128","usize",
+    "f32","f64","bool","char","str","String","Option","Result","Vec","Box","Arc","Rc",
+    "Mutex","Some","None","Ok","Err"
+  ]),
+  javascript: new Set(["true","false","null","undefined","NaN","Infinity","Promise","Array","Object","String","Number","Boolean"]),
+  go: new Set(["int","int8","int16","int32","int64","uint","uint8","uint16","uint32","uint64","float32","float64","string","bool","byte","rune","error","nil","true","false"])
+};
+
+const BUILTINS_BY_LANG = {
+  c: new Set(["printf","scanf","malloc","free","memcpy","memset","strlen","strcmp","strcpy","fopen","fclose","fprintf","sprintf"]),
+  cpp: new Set(["printf","scanf","cout","cin","endl","make_shared","make_unique"]),
+  python: new Set(["print","len","range","enumerate","zip","map","filter","isinstance","open","sum","min","max","abs"]),
+  rust: new Set(["println","print","eprintln","eprint","format","panic","vec","assert","assert_eq"]),
+  javascript: new Set(["console","log","warn","error","document","window","fetch","setTimeout","setInterval","JSON","parse","stringify"])
+};
+
+function highlightCode(code, rawLang) {
+  const normLang = (rawLang || "").toLowerCase().trim();
+  const langKey = normLang === "c++" ? "cpp" : (normLang === "js" || normLang === "ts" || normLang === "jsx" || normLang === "tsx") ? "javascript" : (normLang === "py") ? "python" : (normLang === "rs") ? "rust" : (normLang === "sh" || normLang === "bash") ? "bash" : normLang;
+  
+  const keywords = KEYWORDS_BY_LANG[langKey] || KEYWORDS_BY_LANG.c;
+  const types = TYPES_BY_LANG[langKey] || TYPES_BY_LANG.c;
+  const builtins = BUILTINS_BY_LANG[langKey] || new Set();
+
+  if (langKey === "json") {
+    return highlightJson(code);
+  }
+
+  const tokenRegex = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/|#[^\n]*)|("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)|(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b|0x[0-9a-fA-F]+)|([a-zA-Z_$][\w$]*(?:\s*!)?)|([+\-*/%&|^~!=<>?:;,.()\[\]{}]+)|(\s+)|(.)/g;
+
+  let out = "";
+  let match;
+  while ((match = tokenRegex.exec(code)) !== null) {
+    const [full, comment, string, number, word, op, whitespace, other] = match;
+    if (comment) {
+      if ((langKey === "c" || langKey === "cpp") && (comment.startsWith("#include") || comment.startsWith("#define") || comment.startsWith("#ifdef") || comment.startsWith("#endif"))) {
+        out += `<span class="tok-prep">${esc(comment)}</span>`;
+      } else {
+        out += `<span class="tok-comment">${esc(comment)}</span>`;
+      }
+    } else if (string) {
+      out += `<span class="tok-str">${esc(string)}</span>`;
+    } else if (number) {
+      out += `<span class="tok-num">${esc(number)}</span>`;
+    } else if (word) {
+      const cleanWord = word.replace(/!$/, "");
+      const isMacro = word.endsWith("!");
+      const nextChar = code.slice(tokenRegex.lastIndex).trimStart()[0];
+      const isFnCall = nextChar === "(" || isMacro;
+
+      if (keywords.has(word) || (langKey === "sql" && keywords.has(word.toUpperCase()))) {
+        out += `<span class="tok-kw">${esc(word)}</span>`;
+      } else if (types.has(word)) {
+        out += `<span class="tok-type">${esc(word)}</span>`;
+      } else if (builtins.has(cleanWord)) {
+        out += `<span class="tok-builtin">${esc(word)}</span>`;
+      } else if (isFnCall) {
+        out += `<span class="tok-fn">${esc(word)}</span>`;
+      } else {
+        out += `<span class="tok-ident">${esc(word)}</span>`;
+      }
+    } else if (op) {
+      out += `<span class="tok-op">${esc(op)}</span>`;
+    } else if (whitespace) {
+      out += esc(whitespace);
+    } else {
+      out += esc(other || full);
+    }
+  }
+  return out;
+}
+
+function highlightJson(code) {
+  return code.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g, function (match) {
+    let cls = 'tok-num';
+    if (/^"/.test(match)) {
+      if (/:$/.test(match)) {
+        cls = 'tok-kw';
+      } else {
+        cls = 'tok-str';
+      }
+    } else if (/true|false/.test(match)) {
+      cls = 'tok-type';
+    } else if (/null/.test(match)) {
+      cls = 'tok-kw';
+    }
+    return `<span class="${cls}">${esc(match)}</span>`;
+  });
+}
+
+function renderMarkdown(text) {
+  if (!text) return "";
+  text = text.replace(/\r\n/g, "\n");
+
+  const parts = [];
+  const fenceRegex = /```([a-zA-Z0-9_+#.-]*)\n([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = fenceRegex.exec(text)) !== null) {
+    const textBefore = text.slice(lastIndex, match.index);
+    if (textBefore) {
+      parts.push({ type: "text", content: textBefore });
+    }
+    const lang = (match[1] || "").trim();
+    const code = match[2].replace(/\n$/, "");
+    parts.push({ type: "code", lang, code });
+    lastIndex = fenceRegex.lastIndex;
+  }
+
+  const textAfter = text.slice(lastIndex);
+  if (textAfter) {
+    parts.push({ type: "text", content: textAfter });
+  }
+
+  let htmlOut = "";
+  for (const part of parts) {
+    if (part.type === "code") {
+      const displayLang = LANG_MAP[part.lang.toLowerCase()] || (part.lang ? part.lang.toUpperCase() : "CODE");
+      const highlighted = highlightCode(part.code, part.lang);
+      const encodedRaw = encodeURIComponent(part.code);
+      htmlOut += `
+<div class="code-container">
+  <div class="code-header">
+    <span class="code-lang">${esc(displayLang)}</span>
+    <button type="button" class="copy-btn" data-code="${encodedRaw}" onclick="copyCode(this)" title="Copiar código">
+      <svg class="copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg>
+      <span class="btn-text">Copiar</span>
+    </button>
+  </div>
+  <pre class="code-body"><code>${highlighted}</code></pre>
+</div>`;
+    } else {
+      let formatted = esc(part.content);
+      formatted = formatted.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
+      formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      formatted = formatted.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+      htmlOut += `<div class="msg-text">${formatted}</div>`;
+    }
+  }
+
+  return htmlOut;
+}
+
+function copyCode(btn) {
+  const code = decodeURIComponent(btn.getAttribute("data-code") || "");
+  const updateBtn = () => {
+    const textSpan = btn.querySelector(".btn-text");
+    const oldText = textSpan.textContent;
+    btn.classList.add("copied");
+    textSpan.textContent = "¡Copiado!";
+    setTimeout(() => {
+      btn.classList.remove("copied");
+      textSpan.textContent = oldText;
+    }, 2000);
+  };
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(code).then(updateBtn).catch(() => fallbackCopy(code, updateBtn));
+  } else {
+    fallbackCopy(code, updateBtn);
+  }
+}
+
+function fallbackCopy(text, cb) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try {
+    document.execCommand("copy");
+    if (cb) cb();
+  } catch (e) {}
+  document.body.removeChild(ta);
+}
+
 async function api(path, opts) {
   const r = await fetch("/exodus/" + path, opts);
   let body = {};
@@ -121,7 +467,7 @@ async function loadState() {
     $("health").textContent = s.verified_chain ? "ok" : "degraded";
     const g = m.gpu || {};
     $("sb-model").textContent = "model: " + selectedModel();
-    $("sb-gpu").textContent = "gpu: " + (g.available ? g.tier + " · " + (g.gpu_layers ?? "layers auto") : "none") + (g.available ? "" : "");
+    $("sb-gpu").textContent = "gpu: " + (g.available ? g.tier + " · " + (g.gpu_layers ?? "layers auto") : "none");
     $("sb-gpu").className = "chip " + (g.available ? "gpu ok" : "");
     const models = m.models || [];
     $("sb-models").textContent = "models: " + models.length;
@@ -151,7 +497,12 @@ function addMsg(role, content) {
   if (empty) empty.remove();
   const div = document.createElement("div");
   div.className = "msg " + role;
-  div.innerHTML = `<span class="role">${esc(role)}</span>${esc(content)}`;
+  const roleSpan = `<span class="role">${esc(role)}</span>`;
+  if (role === "assistant" || role === "user") {
+    div.innerHTML = roleSpan + renderMarkdown(content);
+  } else {
+    div.innerHTML = roleSpan + `<div class="msg-text">${esc(content)}</div>`;
+  }
   conv.appendChild(div);
   conv.scrollTop = conv.scrollHeight;
 }
