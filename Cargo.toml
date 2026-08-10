@@ -1,6 +1,6 @@
 [package]
 name = "exodus"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Free, non-profit, open distributed compute network."
 license = "MIT"
