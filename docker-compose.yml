@@ -1,9 +1,9 @@
 services:
   node:
-build:
+    build:
       context: .
       dockerfile: Dockerfile
-      args:
+#      args:
         # LLAMA_VERSION: "b10276"     # llama.cpp release tag
         # LLAMA_ASSET: "llama-b10276-bin-ubuntu-vulkan-x64.tar.gz" # or -ubuntu-x64 for CPU
         # CUDA_VERSION: "12.8.1"        # nvidia/cuda runtime base
@@ -37,8 +37,8 @@ build:
 
     # ---- persistent state -------------------------------------------------
     volumes:
-      - ./exodus-data:/data       # identity.key + ledger.sqlite3
-      - ./exodus-models:/models   # local model files
+      - exodus-data:/data       # identity.key + ledger.sqlite3
+      - exodus-models:/models   # local model files
 
     # ---- node configuration ------------------------------------------------
     environment:
@@ -76,7 +76,7 @@ build:
       dockerfile: Dockerfile
     image: exodus:latest
     profiles: ["simulate"]
-    command: ["simulate"]
+    command: ["simulate exodus"]
 
 volumes:
   exodus-data:
